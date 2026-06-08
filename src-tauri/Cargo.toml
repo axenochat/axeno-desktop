@@ -1,0 +1,50 @@
+[package]
+name = "axeno-client"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "axeno_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", package = "libsignal-protocol" }
+
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+thiserror = "1"
+
+arti-client = { version = "0.41", features = ["tokio", "static", "onion-service-client"] }
+tor-rtcompat = { version = "0.41", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+tokio-tungstenite = "0.24"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+# getrandom for our own secure key generation; rand_core/rand_chacha 0.9 match current libsignal-protocol
+getrandom = "0.2"
+rand_core = "0.9"
+rand_chacha = "0.9"
+
+# The updater only applies to desktop targets (it replaces the installed bundle).
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"
+
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

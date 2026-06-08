@@ -1,0 +1,163 @@
+name: Release
+
+# Builds and publishes the signed desktop client when a version tag is pushed.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Produces, on a single GitHub Release:
+#   - signed bundles for macOS (Intel + Apple Silicon), Windows (x86_64 + ARM64),
+#     and Linux (x86_64 + aarch64, AppImage)
+#   - the `.sig` files and a `latest.json` manifest the in-app updater reads
+#
+# Structure: one `create-release` job makes a single fresh draft release and
+# outputs its id; the build matrix uploads into that release by id. The matrix
+# runs serially (max-parallel: 1) because tauri-action's latest.json update is a
+# read-modify-write on one shared asset and races if jobs run concurrently.
+#
+# The release is created as a DRAFT; auto-update goes live once you publish it.
+#
+# Required repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY           contents of the minisign private key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the key's password
+#
+# ARM targets build on GitHub's native ARM runners (free for public repos).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.mk.outputs.result }}
+    steps:
+      - name: Create a fresh draft release
+        id: mk
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const { owner, repo } = context.repo;
+            // Delete any existing release for this tag so we always start from a
+            // clean slate (no leftover assets for jobs to race on).
+            const list = await github.rest.repos.listReleases({ owner, repo, per_page: 100 });
+            for (const r of list.data) {
+              if (r.tag_name === tag) {
+                await github.rest.repos.deleteRelease({ owner, repo, release_id: r.id });
+              }
+            }
+            const res = await github.rest.repos.createRelease({
+              owner, repo, tag_name: tag,
+              name: `Axeno ${tag}`,
+              body: 'See the assets below to download and install Axeno.',
+              draft: true, prerelease: false,
+            });
+            return res.data.id;
+
+  build:
+    name: Build (${{ matrix.slug }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - slug: linux-x86_64
+            platform: ubuntu-22.04
+            args: ""
+            rust-targets: ""
+          - slug: linux-aarch64
+            platform: ubuntu-22.04-arm
+            args: ""
+            rust-targets: ""
+          - slug: macos-x86_64
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            rust-targets: x86_64-apple-darwin
+          - slug: macos-aarch64
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            rust-targets: aarch64-apple-darwin
+          - slug: windows-x86_64
+            platform: windows-latest
+            args: ""
+            rust-targets: ""
+          - slug: windows-aarch64
+            platform: windows-11-arm
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler \
+            xdg-utils
+
+      # libsignal's spqr crate compiles .proto files with prost-build, which
+      # shells out to `protoc`. Not preinstalled on macOS/Windows runners.
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "28.3"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\protoc.zip"
+          Expand-Archive "$env:RUNNER_TEMP\protoc.zip" -DestinationPath "$env:RUNNER_TEMP\protoc"
+          "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and upload to the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

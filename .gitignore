@@ -1,0 +1,24 @@
+node_modules/
+dist/
+
+# Rust / Tauri build output
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+
+# Assistant/local config
+.claude/

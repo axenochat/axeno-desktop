@@ -1,0 +1,113 @@
+.app-root {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg-base);
+  overflow: hidden;
+  color: var(--text-primary);
+}
+
+.app-centered {
+  align-items: center;
+  justify-content: center;
+}
+
+.app-loading-spinner {
+  border-color: var(--border);
+  border-top-color: var(--brand);
+}
+
+.login-form {
+  width: 100%;
+}
+
+.empty-chat {
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+/* ── Code warning modal (Layer 3: active codes on blocked relay) ── */
+.code-warning-modal {
+  position: fixed;
+  z-index: 100;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  padding: 28px 32px;
+  max-width: 420px;
+  width: 90vw;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  animation: modal-pop 0.15s ease-out;
+  text-align: center;
+}
+
+@keyframes modal-pop {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.95); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+.code-warning-icon {
+  font-size: 32px;
+  margin-bottom: 10px;
+}
+
+.code-warning-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin: 0 0 10px;
+}
+
+.code-warning-body {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0 0 6px;
+}
+
+.code-warning-note {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin: 0 0 18px;
+}
+
+.code-warning-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.btn-secondary {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.btn-secondary:hover { background: var(--bg-hover); }
+.btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-danger {
+  background: var(--accent-red);
+  color: #fff;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, opacity 0.12s;
+}
+
+.btn-danger:hover { opacity: 0.9; }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
