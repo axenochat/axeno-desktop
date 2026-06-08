@@ -2,7 +2,7 @@
 
 Axeno is a private desktop messenger. It uses the Signal Protocol for end-to-end encryption and routes traffic through Tor. There are no accounts, phone numbers, or email addresses; you add contacts by exchanging one-time connection codes.
 
-This repository is the **desktop client**, built with [Tauri](https://tauri.app) (Rust backend, React frontend). It connects to a self-hosted Rust relay — see [**axeno-relay**](https://github.com/axeno-chat/axeno-relay) to run one.
+This repository is the **desktop client**, built with [Tauri](https://tauri.app) (Rust backend, React frontend). It connects to a self-hosted Rust relay — see [**axeno-relay**](https://github.com/axenochat/axeno-relay) to run one.
 
 > **Status:** early development, not independently audited. Do not rely on it where your safety is at stake.
 
@@ -18,7 +18,7 @@ This repository is the **desktop client**, built with [Tauri](https://tauri.app)
 
 ## Install
 
-Download the latest build for your platform from the [Releases](https://github.com/axeno-chat/axeno-desktop/releases) page:
+Download the latest build for your platform from the [Releases](https://github.com/axenochat/axeno-desktop/releases) page:
 
 - **macOS** — `.dmg` (Apple Silicon or Intel)
 - **Windows** — `-setup.exe` (x64 or ARM64)
@@ -51,7 +51,7 @@ Then open **Settings**, add a relay's `.onion` address, and select it as your de
 
 Axeno aims to protect message confidentiality and integrity, sender anonymity from the relay (sealed sender), contact-graph privacy (per-contact mailboxes), IP-level unlinkability (Tor), and confidentiality of your identity and history at rest while the app is locked.
 
-It does not protect against a compromised device, global traffic analysis, or loss of relay availability. For the full model and the relay's role, see the [relay repository](https://github.com/axeno-chat/axeno-relay).
+It does not protect against a compromised device, global traffic analysis, or loss of relay availability. For the full model and the relay's role, see the [relay repository](https://github.com/axenochat/axeno-relay).
 
 ## License
 
