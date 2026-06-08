@@ -67,34 +67,40 @@ jobs:
             return res.data.id;
 
   build:
-    name: Build (${{ matrix.slug }})
+    name: ${{ matrix.name }}
     needs: create-release
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         include:
-          - slug: linux-x86_64
+          - name: Linux x64 (AppImage)
+            slug: linux-x86_64
             platform: ubuntu-22.04
             args: ""
             rust-targets: ""
-          - slug: linux-aarch64
+          - name: Linux Arm64 (AppImage)
+            slug: linux-aarch64
             platform: ubuntu-22.04-arm
             args: ""
             rust-targets: ""
-          - slug: macos-x86_64
+          - name: Macos Intel
+            slug: macos-x86_64
             platform: macos-latest
             args: "--target x86_64-apple-darwin"
             rust-targets: x86_64-apple-darwin
-          - slug: macos-aarch64
+          - name: Macos Arm
+            slug: macos-aarch64
             platform: macos-latest
             args: "--target aarch64-apple-darwin"
             rust-targets: aarch64-apple-darwin
-          - slug: windows-x86_64
+          - name: Windows x64 (exe)
+            slug: windows-x86_64
             platform: windows-latest
             args: ""
             rust-targets: ""
-          - slug: windows-aarch64
+          - name: Windows Arm64 (exe)
+            slug: windows-aarch64
             platform: windows-11-arm
             args: ""
             rust-targets: ""
