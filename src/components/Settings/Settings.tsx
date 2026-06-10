@@ -5,6 +5,7 @@ import {
   IconInfo, IconCopy, IconPlus, IconTrash, IconCheck, IconChevronDown, IconEdit,
 } from "../icons";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import "./Settings.css";
 
 type Section = "identity" | "servers" | "appearance" | "about";
@@ -531,6 +532,10 @@ function AppearanceSection({ settings, onChange }: { settings: AppSettings; onCh
 
 
 function AboutSection({ settings, onChange, torStatus, torError }: { settings: AppSettings; onChange: (s: AppSettings) => void; torStatus: "connecting" | "connected" | "failed"; torError?: string }) {
+  // Show the real app version (from tauri.conf.json) so it can never drift from
+  // what is published.
+  const [version, setVersion] = useState("");
+  useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
   const torLabel =
     torStatus === "connected" ? "Connected" :
       torStatus === "connecting" ? "Bootstrapping..." :
@@ -539,13 +544,18 @@ function AboutSection({ settings, onChange, torStatus, torError }: { settings: A
   return (
     <Section title="About">
       <div className="about-block">
-        <div className="about-row"><span>Version</span><span className="mono">beta-1.0</span></div>
+        <div className="about-row"><span>Version</span><span className="mono">{version || "..."}</span></div>
         <div className="about-row"><span>Tor</span><span>{torLabel}</span></div>
       </div>
       <Row
         label="Check for updates"
-        description="Checks GitHub for new signed releases on launch and prompts before installing. This is a direct connection to GitHub (not over Tor) and reveals your IP to GitHub."
+        description="Checks GitHub for new signed releases on launch and prompts before installing. Updates are always cryptographically signed and verified before they install."
         control={<Toggle on={settings.autoUpdateCheck} onChange={(v) => onChange({ ...settings, autoUpdateCheck: v })} />}
+      />
+      <Row
+        label="Update over Tor"
+        description="Routes update checks and downloads through Tor so GitHub does not see your IP. GitHub sometimes blocks Tor, so updates may fail; if they do, retry or turn this off to use a direct connection."
+        control={<Toggle on={settings.updateOverTor} onChange={(v) => onChange({ ...settings, updateOverTor: v })} />}
       />
     </Section>
   );

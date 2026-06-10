@@ -10,7 +10,7 @@ use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc, oneshot, Mutex}, time::{sleep, timeout, Duration, Instant}};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{mpsc, oneshot, Mutex}, time::{sleep, timeout, Duration, Instant}};
 use tokio_tungstenite::{connect_async, client_async, tungstenite::{client::IntoClientRequest, Message}, WebSocketStream};
 use tor_rtcompat::PreferredRuntime;
 use uuid::Uuid;
@@ -1184,6 +1184,83 @@ fn validate_recipient_id(id: &str) -> Result<(), String> {
     } else {
         Err("recipient id must start with mbx_ and be 16-128 URL-safe characters".into())
     }
+}
+
+/// Start a minimal SOCKS5 proxy on `127.0.0.1:<ephemeral>` backed by the Tor
+/// client, returning the bound port. The in-app updater is pointed at this with
+/// `socks5h://127.0.0.1:<port>` so its HTTPS requests to GitHub go through Tor.
+///
+/// Only the CONNECT command is supported, and with `socks5h` the client sends
+/// hostnames (not pre-resolved IPs), so DNS is resolved over Tor too. No auth is
+/// negotiated; the listener is loopback-only.
+pub async fn start_socks_proxy(
+    tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
+) -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| format!("SOCKS bind failed: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((sock, _)) => {
+                    let tc = tor_client.clone();
+                    tokio::spawn(async move { let _ = handle_socks_conn(sock, tc).await; });
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+    Ok(port)
+}
+
+async fn handle_socks_conn(
+    mut sock: TcpStream,
+    tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
+) -> Result<(), String> {
+    // Greeting: VER, NMETHODS, METHODS...
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await.map_err(|e| e.to_string())?;
+    if head[0] != 0x05 { return Err("not SOCKS5".into()); }
+    let mut methods = vec![0u8; head[1] as usize];
+    sock.read_exact(&mut methods).await.map_err(|e| e.to_string())?;
+    // Select "no authentication".
+    sock.write_all(&[0x05, 0x00]).await.map_err(|e| e.to_string())?;
+
+    // Request: VER, CMD, RSV, ATYP, ADDR, PORT.
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await.map_err(|e| e.to_string())?;
+    if req[0] != 0x05 { return Err("bad SOCKS request".into()); }
+    if req[1] != 0x01 {
+        let _ = sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await; // command not supported
+        return Err("only CONNECT is supported".into());
+    }
+    let host = match req[3] {
+        0x01 => { let mut a = [0u8; 4]; sock.read_exact(&mut a).await.map_err(|e| e.to_string())?; std::net::Ipv4Addr::from(a).to_string() }
+        0x04 => { let mut a = [0u8; 16]; sock.read_exact(&mut a).await.map_err(|e| e.to_string())?; std::net::Ipv6Addr::from(a).to_string() }
+        0x03 => {
+            let mut len = [0u8; 1];
+            sock.read_exact(&mut len).await.map_err(|e| e.to_string())?;
+            let mut d = vec![0u8; len[0] as usize];
+            sock.read_exact(&mut d).await.map_err(|e| e.to_string())?;
+            String::from_utf8(d).map_err(|_| "bad domain".to_string())?
+        }
+        _ => { let _ = sock.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await; return Err("bad address type".into()); }
+    };
+    let mut port_bytes = [0u8; 2];
+    sock.read_exact(&mut port_bytes).await.map_err(|e| e.to_string())?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    let client = tor_client.lock().await.clone().ok_or_else(|| "Tor is not ready".to_string())?;
+    // Keep update traffic on its own circuit, separate from messaging mailboxes.
+    let mut prefs = StreamPrefs::new();
+    prefs.set_isolation(isolation_token_for("axeno-updater"));
+    let mut stream = match client.connect_with_prefs((host.as_str(), port), &prefs).await {
+        Ok(s) => s,
+        Err(_) => { let _ = sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await; return Err("Tor connect failed".into()); }
+    };
+    // Success, BND.ADDR 0.0.0.0:0.
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.map_err(|e| e.to_string())?;
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+    Ok(())
 }
 
 fn validate_bundle_id(id: &str) -> Result<(), String> {

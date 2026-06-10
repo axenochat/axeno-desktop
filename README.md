@@ -24,7 +24,7 @@ Download the latest build for your platform from the [Releases](https://github.c
 - **Windows**: `-setup.exe` (x64 or ARM64)
 - **Linux**: `.AppImage` (x86_64 or aarch64; requires FUSE / `libfuse2`)
 
-The app checks for updates on launch and prompts before installing a new signed release. You can disable the check in **Settings → About → Check for updates** (the check is a direct, non-Tor request to GitHub).
+The app checks for updates on launch and prompts before installing a new signed release. By default the check and download are routed through Tor, so GitHub does not see your IP. GitHub sometimes blocks Tor, in which case the update fails and you can retry or turn off **Update over Tor** in **Settings → About**; you can also disable update checks there entirely.
 
 ## Build from source
 
@@ -45,7 +45,19 @@ npm run tauri dev        # development with hot reload
 
 On first launch you create an identity by choosing a display name and a passphrase. The passphrase encrypts your local vault and is required to unlock the app on each start.
 
-Then open **Settings**, add a relay's `.onion` address, and select it as your default relay. To add a contact, one person generates a connection code in **Add Contact** and shares it with the other, who enters it in their own **Add Contact**.
+A new install comes with the official relay pre-selected as your default, so you can start messaging right away. To add a contact, one person generates a connection code in **Add Contact** and shares it with the other, who enters it in their own **Add Contact**.
+
+## Relays
+
+A relay is the broker that passes encrypted messages between you and your contacts. It never sees plaintext, but its operator can observe transport metadata: which mailbox talks to which, timing, and message sizes.
+
+New installs are pre-configured with the official relay:
+
+```
+ws://qm73p7v2lh63lgavogxrvf3wafv7srrcr65jgcqckuphmai4dqv3ydad.onion/ws
+```
+
+It is a normal relay entry. You can remove it under **Settings** at any time (if you remove it, it is not added back), and you can add your own or a friend's relay there and set that as your default. Running your own relay is the most private option, since you are not handing transport metadata to someone else; see [axeno-relay](https://github.com/axenochat/axeno-relay) to set one up.
 
 ## Security model
 

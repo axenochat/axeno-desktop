@@ -13,6 +13,7 @@ interface InspectedConnectionCode {
   server_url: string;
   server_name: string;
   is_known_private: boolean;
+  is_official: boolean;
 }
 
 export default function AddContact({ onClose, onAdded }: Props) {
@@ -53,6 +54,13 @@ export default function AddContact({ onClose, onAdded }: Props) {
       });
     } catch (e) {
       setError(typeof e === "string" ? e : "Could not read connection code");
+      return;
+    }
+    // The official relay is the client's own default, so it needs no extra trust
+    // decision: add directly without the confirm-relay prompt. Any other relay
+    // still gets confirmed before the slow Tor connect.
+    if (inspected.is_official) {
+      await runAdd(trimmed);
       return;
     }
     setWarn(inspected);

@@ -37,6 +37,11 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 
 tokio-tungstenite = "0.24"
+# We do not call reqwest directly. This declares the same reqwest that
+# tauri-plugin-updater pulls in, with the `socks` feature on, so cargo feature
+# unification enables SOCKS support there too — letting the updater route through
+# our local Arti SOCKS proxy (Tor). Keep the major version in sync with the plugin.
+reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 base64 = "0.22"

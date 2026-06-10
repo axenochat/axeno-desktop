@@ -159,6 +159,11 @@ pub struct MessagingStore {
     /// is suppressed. This is the only durable block — mailboxes and codes are
     /// ephemeral routing that can be re-created, but the identity key is stable.
     #[serde(default)] pub blocked_identities: HashSet<String>,
+    /// True once the built-in official relay has been seeded into this store. It
+    /// is seeded once, as a normal (deletable) relay pre-selected as the default,
+    /// so a fresh install works out of the box. The flag ensures that deleting it
+    /// is permanent: it is not re-added on the next launch.
+    #[serde(default)] pub official_relay_seeded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1753,6 +1758,10 @@ pub struct InspectedConnectionCode {
     pub server_url: String,
     pub server_name: String,
     pub is_known_private: bool,
+    /// True when the code routes through the built-in official relay. The UI uses
+    /// this to skip the "confirm relay" prompt, since the official relay is the
+    /// client's own default and needs no extra trust decision.
+    pub is_official: bool,
 }
 
 /// Decode a connection code locally (no network) to reveal which relay it routes
@@ -1774,16 +1783,55 @@ pub async fn inspect_connection_code(
         .private_servers
         .iter()
         .any(|s| normalize_server_url(Some(s.onion.clone())) == normalized);
+    let is_official = normalized == normalize_server_url(Some(OFFICIAL_RELAY_ONION.to_string()));
     Ok(InspectedConnectionCode {
         is_known_private,
+        is_official,
         server_name: relay_display_name_for_url(&store, &normalized),
         server_url: normalized,
     })
 }
 
+/// The project's hosted relay, baked into the client. Seeded once into a fresh
+/// store as a normal, deletable relay and pre-selected as the default so a new
+/// install can message immediately. Running your own relay is more private (its
+/// operator sees transport metadata like which mailbox talks to which, timing,
+/// and size); this is a convenience default, not a requirement.
+const OFFICIAL_RELAY_ID: &str = "axeno-official";
+const OFFICIAL_RELAY_NAME: &str = "Official Relay";
+const OFFICIAL_RELAY_ONION: &str = "ws://qm73p7v2lh63lgavogxrvf3wafv7srrcr65jgcqckuphmai4dqv3ydad.onion/ws";
+
+/// Seed the official relay exactly once. Returns true if the store changed (so
+/// the caller persists it). Adds the relay only if an entry for the same onion
+/// is not already present, and sets it as the default only if no default is set,
+/// so it never overrides an existing user choice. Setting the seeded flag (even
+/// when nothing else changes) makes a later deletion permanent.
+fn seed_official_relay(store: &mut MessagingStore) -> bool {
+    if store.official_relay_seeded {
+        return false;
+    }
+    store.official_relay_seeded = true;
+    let onion = normalize_server_url(Some(OFFICIAL_RELAY_ONION.to_string()));
+    if !store.private_servers.iter().any(|s| normalize_server_url(Some(s.onion.clone())) == onion) {
+        store.private_servers.push(PrivateServerSetting {
+            id: OFFICIAL_RELAY_ID.to_string(),
+            name: OFFICIAL_RELAY_NAME.to_string(),
+            onion: onion.clone(),
+        });
+    }
+    if store.default_server_url.as_deref().map(|u| u.trim().is_empty()).unwrap_or(true) {
+        store.default_server_url = Some(onion);
+    }
+    true
+}
+
 pub async fn load_private_server_settings(app: AppHandle, session: &AppSessionState) -> Result<PrivateServerSettings, String> {
+    let _store_guard = session.messaging_store_lock.lock().await;
     let (store_key, legacy_store_key) = store_keys(session).await?;
-    let store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+    let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+    if seed_official_relay(&mut store) {
+        save_store_with_key(&app, &store, &store_key)?;
+    }
     Ok(PrivateServerSettings {
         private_servers: store.private_servers.clone(),
         default_server_url: store.default_server_url.clone(),

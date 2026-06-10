@@ -40,6 +40,10 @@ use identity::{
 /// The Tor client. Lazily bootstrapped in the background.
 pub struct AppTorState {
     pub client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
+    /// Port of the local SOCKS5 proxy backed by the Tor client, once started.
+    /// The in-app updater routes through `socks5h://127.0.0.1:<port>` when the
+    /// user has "Update over Tor" enabled.
+    pub socks_port: Arc<Mutex<Option<u16>>>,
 }
 
 /// The unlocked session: in-memory secrets + KEK. Both wiped on drop.
@@ -427,30 +431,49 @@ async fn change_password(
 #[tauri::command]
 async fn bootstrap_tor(app: AppHandle, state: State<'_, AppTorState>) -> Result<(), String> {
     let client_arc = state.client.clone();
+    let socks_arc = state.socks_port.clone();
     tauri::async_runtime::spawn(async move {
         let _ = app.emit("tor-status", serde_json::json!({ "status": "connecting" }));
 
-        let mut guard = client_arc.lock().await;
-        if guard.is_some() {
-            let _ = app.emit("tor-status", serde_json::json!({ "status": "connected" }));
-            return;
+        {
+            let mut guard = client_arc.lock().await;
+            if guard.is_none() {
+                let config = TorClientConfig::default();
+                match TorClient::create_bootstrapped(config).await {
+                    Ok(client) => { *guard = Some(client); }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "tor-status",
+                            serde_json::json!({ "status": "failed", "reason": e.to_string() }),
+                        );
+                        return;
+                    }
+                }
+            }
         }
 
-        let config = TorClientConfig::default();
-        match TorClient::create_bootstrapped(config).await {
-            Ok(client) => {
-                *guard = Some(client);
-                let _ = app.emit("tor-status", serde_json::json!({ "status": "connected" }));
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "tor-status",
-                    serde_json::json!({ "status": "failed", "reason": e.to_string() }),
-                );
+        // Start the local SOCKS proxy (for the in-app updater) once Tor is up.
+        // Best-effort: a failure here does not block messaging, only Tor updates.
+        {
+            let mut port_guard = socks_arc.lock().await;
+            if port_guard.is_none() {
+                match transport::start_socks_proxy(client_arc.clone()).await {
+                    Ok(port) => { *port_guard = Some(port); }
+                    Err(e) => eprintln!("[axeno] Tor SOCKS proxy failed to start: {e}"),
+                }
             }
         }
+
+        let _ = app.emit("tor-status", serde_json::json!({ "status": "connected" }));
     });
     Ok(())
+}
+
+/// Return the local Tor SOCKS proxy URL once it is up, else `None`. The frontend
+/// passes this to the updater when "Update over Tor" is enabled.
+#[tauri::command]
+async fn tor_proxy_url(state: State<'_, AppTorState>) -> Result<Option<String>, String> {
+    Ok((*state.socks_port.lock().await).map(|p| format!("socks5h://127.0.0.1:{p}")))
 }
 
 
@@ -791,6 +814,7 @@ pub fn run() {
         })
         .manage(AppTorState {
             client: Arc::new(Mutex::new(None)),
+            socks_port: Arc::new(Mutex::new(None)),
         })
         .manage(AppSessionState::default())
         .manage(messaging::MessagingRuntimeState::new())
@@ -805,6 +829,7 @@ pub fn run() {
             update_display_name,
             change_password,
             bootstrap_tor,
+            tor_proxy_url,
             messaging_load_private_server_settings,
             messaging_save_private_server_settings,
             messaging_generate_connection_code,

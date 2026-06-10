@@ -54,9 +54,12 @@ export interface AppSettings {
   notificationShowSender: boolean;
   sendOnEnter: boolean;
   messageTextSize: "small" | "medium" | "large";
-  // When on, the app checks GitHub Releases for updates on launch. This is a
-  // direct (non-Tor) HTTPS request, so it reveals the user's IP to GitHub.
+  // When on, the app checks GitHub Releases for updates on launch.
   autoUpdateCheck: boolean;
+  // When on, update checks and downloads are routed through Tor so GitHub does
+  // not see the user's IP. GitHub sometimes blocks Tor, in which case updates
+  // fail and the user can retry or turn this off.
+  updateOverTor: boolean;
 }
 
 export const defaultSettings: AppSettings = {
@@ -71,6 +74,7 @@ export const defaultSettings: AppSettings = {
   sendOnEnter: true,
   messageTextSize: "medium",
   autoUpdateCheck: true,
+  updateOverTor: true,
 };
 
 export interface BackendContact {

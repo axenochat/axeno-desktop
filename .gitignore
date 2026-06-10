@@ -22,3 +22,4 @@ Thumbs.db
 
 # Assistant/local config
 .claude/
+run-two-client-test.sh

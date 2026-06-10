@@ -1,63 +1,107 @@
 import { useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 import "./UpdatePrompt.css";
 
 type Phase = "idle" | "available" | "downloading" | "ready" | "error";
 
 /**
  * Checks GitHub Releases once on mount (when enabled) and, if a newer signed
- * build is available, prompts the user before downloading and installing it.
+ * build is available, prompts before downloading and installing it.
  *
- * Privacy note: the check is a direct HTTPS request to github.com and is NOT
- * routed through Tor, so it reveals the user's IP to GitHub and signals that
- * they run Axeno. It is therefore gated behind the `enabled` setting, which the
- * user can turn off in Settings → About.
+ * When "Update over Tor" is on, both the check and the download are routed
+ * through the local Arti SOCKS proxy, so GitHub never sees the user's IP. There
+ * is no silent clearnet fallback: if Tor cannot reach GitHub (its CDN often
+ * blocks Tor exits) the attempt fails and the user can retry or turn the option
+ * off in Settings.
  */
-export default function UpdatePrompt({ enabled }: { enabled: boolean }) {
+export default function UpdatePrompt({ enabled, updateOverTor }: { enabled: boolean; updateOverTor: boolean }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [update, setUpdate] = useState<Update | null>(null);
   const [progress, setProgress] = useState(0);
   const [errorText, setErrorText] = useState("");
-  // Guard against React 18/19 StrictMode double-invoking the effect, which
-  // would fire two concurrent update checks.
-  const checkedRef = useRef(false);
+  // Whether the last failure was during the check or the download, so Retry
+  // re-runs the right step.
+  const [failedAction, setFailedAction] = useState<"check" | "download">("check");
+  // Guard against React StrictMode double-invoking the effect (two checks), and
+  // against setting state after unmount.
+  const startedRef = useRef(false);
+  const aliveRef = useRef(true);
+
+  // Poll the backend for the Tor SOCKS proxy URL, which becomes available once
+  // Tor finishes bootstrapping. Returns undefined if it does not come up in time.
+  const resolveTorProxy = async (timeoutMs: number): Promise<string | undefined> => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const url = await invoke<string | null>("tor_proxy_url");
+        if (url) return url;
+      } catch { /* ignore and retry */ }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return undefined;
+  };
+
+  const runCheck = async (manual: boolean) => {
+    try {
+      let proxy: string | undefined;
+      if (updateOverTor) {
+        // On the launch check, wait a while for Tor to bootstrap. On a manual
+        // retry, only briefly: if Tor still is not up, say so rather than hang.
+        proxy = await resolveTorProxy(manual ? 5000 : 90000);
+        if (!proxy) {
+          if (manual && aliveRef.current) {
+            setFailedAction("check");
+            setErrorText("Tor is not connected yet.");
+            setPhase("error");
+          }
+          return; // Tor not ready: skip silently on the launch check.
+        }
+      }
+      const found = await check(proxy ? { proxy } : {});
+      if (!aliveRef.current) return;
+      if (found) {
+        setUpdate(found);
+        setPhase("available");
+      } else if (manual) {
+        setPhase("idle");
+        setUpdate(null);
+      }
+    } catch (e) {
+      if (!aliveRef.current) return;
+      setFailedAction("check");
+      setErrorText(e instanceof Error ? e.message : String(e));
+      setPhase("error");
+    }
+  };
 
   useEffect(() => {
-    if (!enabled || checkedRef.current) return;
-    checkedRef.current = true;
-    let cancelled = false;
-    (async () => {
-      try {
-        const found = await check();
-        if (!cancelled && found) {
-          setUpdate(found);
-          setPhase("available");
-        }
-      } catch {
-        // Offline, behind a captive portal, or GitHub unreachable: stay silent.
-        // Update checks must never interrupt normal use.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    aliveRef.current = true;
+    if (!enabled || startedRef.current) return;
+    startedRef.current = true;
+    void runCheck(false);
+    return () => { aliveRef.current = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
-  if (phase === "idle" || !update) return null;
+  if (phase === "idle" || (!update && phase !== "error")) return null;
 
   const dismiss = () => {
-    if (phase === "downloading") return; // don't allow cancelling mid-install
+    if (phase === "downloading") return; // don't cancel mid-install
     setPhase("idle");
     setUpdate(null);
   };
 
   const install = async () => {
+    if (!update) return;
     setPhase("downloading");
     setProgress(0);
     try {
       let downloaded = 0;
       let total = 0;
+      // Reuses the proxy the Update was checked with, so this stays on Tor when
+      // the check was over Tor.
       await update.downloadAndInstall((event) => {
         switch (event.event) {
           case "Started":
@@ -75,16 +119,19 @@ export default function UpdatePrompt({ enabled }: { enabled: boolean }) {
       setPhase("ready");
       await relaunch();
     } catch (e) {
+      setFailedAction("download");
       setErrorText(e instanceof Error ? e.message : String(e));
       setPhase("error");
     }
   };
 
+  const retry = () => { if (failedAction === "download") void install(); else void runCheck(true); };
+
   return (
     <>
       <div className="context-menu-backdrop" onClick={dismiss} />
       <div className="code-warning-modal update-modal">
-        {phase === "available" && (
+        {phase === "available" && update && (
           <>
             <h3 className="code-warning-title">Update available</h3>
             <p className="code-warning-body">
@@ -100,10 +147,12 @@ export default function UpdatePrompt({ enabled }: { enabled: boolean }) {
           </>
         )}
 
-        {phase === "downloading" && (
+        {phase === "downloading" && update && (
           <>
             <h3 className="code-warning-title">Installing update…</h3>
-            <p className="code-warning-body">Downloading and verifying Axeno {update.version}.</p>
+            <p className="code-warning-body">
+              Downloading and verifying Axeno {update.version}{updateOverTor ? " over Tor" : ""}.
+            </p>
             <div className="update-progress-track">
               <div className="update-progress-fill" style={{ width: `${progress}%` }} />
             </div>
@@ -111,7 +160,7 @@ export default function UpdatePrompt({ enabled }: { enabled: boolean }) {
           </>
         )}
 
-        {phase === "ready" && (
+        {phase === "ready" && update && (
           <>
             <h3 className="code-warning-title">Restarting…</h3>
             <p className="code-warning-body">Axeno {update.version} has been installed.</p>
@@ -121,11 +170,16 @@ export default function UpdatePrompt({ enabled }: { enabled: boolean }) {
         {phase === "error" && (
           <>
             <div className="code-warning-icon">⚠️</div>
-            <h3 className="code-warning-title">Update failed</h3>
-            <p className="code-warning-body">The update could not be installed.</p>
+            <h3 className="code-warning-title">{updateOverTor ? "Update over Tor failed" : "Update failed"}</h3>
+            <p className="code-warning-body">
+              {updateOverTor
+                ? "The update could not be completed. Your download may be blocked because you are using Tor. Retry, or turn off “Update over Tor” in Settings → About and try again."
+                : "The update could not be completed."}
+            </p>
             {errorText && <p className="code-warning-note mono">{errorText}</p>}
             <div className="code-warning-actions">
               <button className="btn btn-secondary" onClick={dismiss}>Close</button>
+              <button className="btn btn-primary" onClick={retry}>Retry</button>
             </div>
           </>
         )}
