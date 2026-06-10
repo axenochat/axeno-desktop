@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tor_rtcompat::PreferredRuntime;
+use zeroize::Zeroize;
 
 pub mod identity;
 pub mod messaging;
@@ -122,6 +123,10 @@ fn save_unified_state(app: &AppHandle, state: &UnifiedAppStateFile) -> Result<()
     Ok(())
 }
 
+// The message/contact store is no longer mirrored into axeno.state on every save
+// (messages.store is the single source of truth; see encrypt_and_write_store).
+// Retained for the one-time migration read path and possible future use.
+#[allow(dead_code)]
 pub(crate) fn update_unified_message_store(app: &AppHandle, store_json: Vec<u8>) -> Result<(), String> {
     let mut unified = load_unified_state(app).unwrap_or_else(|_| UnifiedAppStateFile { version: 1, ..Default::default() });
     unified.version = 1;
@@ -254,12 +259,15 @@ async fn has_identity(app: AppHandle) -> Result<bool, String> {
 async fn create_identity(
     app: AppHandle,
     session: State<'_, AppSessionState>,
-    passphrase: String,
+    mut passphrase: String,
     display_name: String,
 ) -> Result<UnlockResponse, String> {
-    let created = id_create(&passphrase, &display_name).map_err(|e| e.to_string())?;
-    drop(passphrase); // explicit drop for clarity; the String allocator may still hold it briefly
+    let result = id_create(&passphrase, &display_name);
+    passphrase.zeroize(); // best-effort wipe of our copy on every path
+    let created = result.map_err(|e| e.to_string())?;
 
+    // A fresh identity must not see any message store cached from a prior one.
+    messaging::clear_store_cache();
     save_vault(&app, &created.blob)?;
 
     let response = UnlockResponse {
@@ -281,11 +289,23 @@ async fn create_identity(
 async fn unlock_identity(
     app: AppHandle,
     session: State<'_, AppSessionState>,
-    passphrase: String,
+    mut passphrase: String,
 ) -> Result<UnlockResponse, String> {
     let blob = load_vault(&app)?;
-    let unlocked = id_unlock(&blob, &passphrase).map_err(|_| "incorrect password".to_string())?;
-    drop(passphrase);
+    let result = id_unlock(&blob, &passphrase);
+    passphrase.zeroize(); // best-effort wipe of our copy on every path
+    // Distinguish a wrong password (AEAD decryption failure) from integrity or
+    // version failures. Collapsing everything to "incorrect password" hid genuine
+    // tamper/corruption signals and confused users hitting a newer-vault file.
+    let unlocked = result.map_err(|e| match e {
+        identity::IdentityError::Decrypt => "incorrect password".to_string(),
+        identity::IdentityError::Signal(detail) => {
+            format!("vault integrity check failed — the identity file may be corrupted or tampered with: {detail}")
+        }
+        identity::IdentityError::Serde(detail) => format!("vault could not be read: {detail}"),
+        identity::IdentityError::Kdf(detail) => format!("vault key derivation was rejected: {detail}"),
+        other => format!("vault could not be unlocked: {other}"),
+    })?;
 
     let response = UnlockResponse {
         fingerprint: fingerprint(&blob),
@@ -316,6 +336,8 @@ async fn current_identity_public(app: AppHandle) -> Result<PublicIdentityRespons
 #[tauri::command]
 async fn lock_identity(session: State<'_, AppSessionState>) -> Result<(), String> {
     *session.session.lock().await = None;
+    // Drop the decrypted message store (and its resident key) from memory on lock.
+    messaging::clear_store_cache();
     Ok(())
 }
 
@@ -349,25 +371,48 @@ async fn update_display_name(
 async fn change_password(
     app: AppHandle,
     session: State<'_, AppSessionState>,
-    new_passphrase: String,
+    mut new_passphrase: String,
 ) -> Result<(), String> {
     let _store_guard = session.messaging_store_lock.lock().await;
     let mut blob = load_vault(&app)?;
     let mut guard = session.session.lock().await;
     let unlocked = guard.as_mut().ok_or_else(|| "vault is locked".to_string())?;
 
-    let old_key = unlocked.key.expose_for_rekey();
-    let new_key =
-        change_passphrase(&mut blob, &unlocked.secrets, &new_passphrase).map_err(|e| e.to_string())?;
-    drop(new_passphrase);
-    let new_key_bytes = new_key.expose_for_rekey();
+    let mut old_key = unlocked.key.expose_for_rekey();
+    let rekey = change_passphrase(&mut blob, &unlocked.secrets, &new_passphrase);
+    new_passphrase.zeroize();
+    let new_key = match rekey {
+        Ok(k) => k,
+        Err(e) => { old_key.zeroize(); return Err(e.to_string()); }
+    };
+    let mut new_key_bytes = new_key.expose_for_rekey();
 
-    // Re-encrypt the message/contact store before committing the vault key change.
-    // Otherwise the vault unlocks with the new password but messages.store remains
-    // encrypted under the old derived store key.
-    messaging::reencrypt_message_store(&app, &old_key, &new_key_bytes)?;
+    // Crash-safe passphrase change. The vault and the message store are both
+    // encrypted under keys derived from the passphrase, so they must change
+    // together. We order the steps so any interruption leaves a recoverable state:
+    //   1. re-encrypt the store under the NEW key into a sidecar (the live store
+    //      stays readable under the OLD key);
+    //   2. commit the vault under the new passphrase;
+    //   3. promote the sidecar over the live store.
+    // Crash before (2): vault+store both still old; the new-key sidecar simply
+    // fails to decrypt on the next unlock and is ignored. Crash between (2) and
+    // (3): the next unlock derives the new key, the old live store fails to load,
+    // and the sidecar is promoted automatically (messaging::try_promote_rekey_sidecar).
+    let result = (|| {
+        messaging::reencrypt_message_store_to_sidecar(&app, &old_key, &new_key_bytes)?;
+        save_vault(&app, &blob)?;
+        messaging::promote_rekey_sidecar(&app, &new_key_bytes)
+    })();
+    old_key.zeroize();
 
-    save_vault(&app, &blob)?;
+    if let Err(e) = result {
+        new_key_bytes.zeroize();
+        return Err(e);
+    }
+    new_key_bytes.zeroize();
+    // The cache is keyed by the old store key; drop it so the next load decrypts
+    // the promoted store under the new key.
+    messaging::clear_store_cache();
     unlocked.key = new_key;
     Ok(())
 }
@@ -551,8 +596,9 @@ async fn messaging_delete_and_block_contact(
 async fn messaging_snapshot(
     app: AppHandle,
     session: State<'_, AppSessionState>,
+    runtime: State<'_, messaging::MessagingRuntimeState>,
 ) -> Result<messaging::MessagingSnapshot, String> {
-    messaging::snapshot(app, &session).await
+    messaging::snapshot(app, &session, &runtime).await
 }
 
 #[tauri::command]

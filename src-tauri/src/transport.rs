@@ -4,9 +4,9 @@
 //! short-lived standalone relay requests for opaque invite-bundle upload/fetch.
 //! It only moves opaque envelopes and opaque encrypted bundles.
 
-use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, sync::{Arc, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
 
-use arti_client::{DataStream, TorClient};
+use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -72,9 +72,9 @@ async fn generate_pow(recipient_id: &str) -> String {
         loop {
             let input = format!("{prefix}{nonce}");
             let hash = Sha256::digest(input.as_bytes());
-            // 20 leading zero bits. MUST match the relay's POW_LEADING_ZERO_BITS
-            // / pow_hash_ok check in axeno-server (main.rs).
-            if hash[0] == 0 && hash[1] == 0 && (hash[2] >> 4) == 0 {
+            // 22 leading zero bits. MUST match the relay's POW_LEADING_ZERO_BITS
+            // / pow_hash_ok check in axeno-relay (config.rs/util.rs).
+            if hash[0] == 0 && hash[1] == 0 && (hash[2] >> 2) == 0 {
                 return format!("{ts_window}:{nonce}");
             }
             nonce += 1;
@@ -381,18 +381,36 @@ pub async fn send_envelope_nowait(
     }
 }
 
+/// Stable Tor stream-isolation token for an isolation key (a mailbox/route id).
+///
+/// Streams sharing a key may share a Tor circuit; streams with different keys are
+/// forced onto separate circuits. Keying by mailbox keeps each of this client's
+/// mailboxes on its own circuit, so a relay or exit cannot correlate two of the
+/// user's mailboxes by observing that they ride the same circuit. The token is
+/// generated once per key and reused, so reconnects for the same mailbox reuse
+/// its circuit pool instead of churning a fresh circuit each time.
+fn isolation_token_for(key: &str) -> IsolationToken {
+    static TOKENS: OnceLock<std::sync::Mutex<HashMap<String, IsolationToken>>> = OnceLock::new();
+    let tokens = TOKENS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = tokens.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard.entry(key.to_string()).or_insert_with(IsolationToken::new)
+}
+
 async fn connect_onion_stream_with_retries(
     tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
+    isolation_key: &str,
     host: &str,
     port: u16,
 ) -> Result<DataStream, String> {
     let client = tor_client.lock().await.clone().ok_or_else(|| "Tor is not bootstrapped yet; call bootstrap_tor first".to_string())?;
+    let mut prefs = StreamPrefs::new();
+    prefs.set_isolation(isolation_token_for(isolation_key));
     let started = Instant::now();
     let mut attempt = 0u32;
 
     loop {
         attempt = attempt.saturating_add(1);
-        let last_error = match timeout(ONION_CONNECT_ATTEMPT_TIMEOUT, client.connect((host, port))).await {
+        let last_error = match timeout(ONION_CONNECT_ATTEMPT_TIMEOUT, client.connect_with_prefs((host, port), &prefs)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => format!("Tor connect failed: {e}"),
             Err(_) => format!("Tor connect timed out after {}s", ONION_CONNECT_ATTEMPT_TIMEOUT.as_secs()),
@@ -419,11 +437,19 @@ async fn connect_onion_stream_with_retries(
 
 /// Send one opaque envelope over a fresh unauthenticated WebSocket.
 ///
-/// This deliberately does not reuse the authenticated receive mailbox socket.
-/// The relay still validates the destination delivery token, but it does not get
-/// a socket-level sender mailbox for the send itself. Sender authenticity remains
-/// inside the sealed-sender/Signal envelope; the relay only sees ciphertext,
-/// destination mailbox, timing, and size.
+/// This is the FALLBACK send path, used only when no live connection is available
+/// for the route (see `send_signal_payload_internal`). It opens a fresh circuit
+/// with no Hello/auth, so the relay gets no socket-level sender mailbox for the
+/// send — it sees only ciphertext, destination mailbox, timing, and size.
+///
+/// Note the steady-state path differs: to avoid a brand-new onion circuit per
+/// message, the primary path reuses the warm, already-authenticated route socket
+/// (the same one that requested the sender certificate). On that path the relay
+/// does observe authenticated-sender-mailbox -> destination-mailbox for the send.
+/// Because every route mailbox is a per-contact pseudonym unlinkable to the stable
+/// Signal identity and to the user's other routes, that linkage is confined to the
+/// single contact pair; it is not linkage to the user's identity or contact graph.
+/// Sender authenticity in both cases lives inside the sealed-sender/Signal envelope.
 pub async fn send_envelope_once(
     tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
     url: String,
@@ -440,6 +466,7 @@ pub async fn send_envelope_once(
     if ciphertext.len() > 512 * 1024 { return Err("ciphertext exceeds 512 KiB frame limit".into()); }
 
     let client_ref = client_ref.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let isolation_key = to.clone();
     let frame = ClientFrame::SendEnvelope {
         client_ref: Some(client_ref.clone()),
         to,
@@ -449,7 +476,7 @@ pub async fn send_envelope_once(
     };
     let parsed = parse_ws_url(&url)?;
     if parsed.host.ends_with(".onion") {
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &isolation_key, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
         run_send_envelope_ws(ws, frame, client_ref).await
@@ -570,7 +597,7 @@ pub async fn request_sender_certificate_once(
 
     let parsed = parse_ws_url(&url)?;
     if parsed.host.ends_with(".onion") {
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &sender_uuid, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
         run_sender_certificate_once_ws(ws, sender_uuid, auth_token, delivery_token, sender_device_id, sender_cert_public_b64).await
@@ -679,7 +706,7 @@ pub async fn upload_invite_bundle(
     let frame = ClientFrame::UploadBundle { request_id: request_id.clone(), bundle_id: bundle_id.clone(), ciphertext, expires_at_ms, pow };
     let parsed = parse_ws_url(&url)?;
     if parsed.host.ends_with(".onion") {
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &bundle_id, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
         run_upload_bundle_ws(ws, frame, request_id, bundle_id).await
@@ -701,7 +728,7 @@ pub async fn fetch_invite_bundle(
     let frame = ClientFrame::FetchBundle { request_id: request_id.clone(), bundle_id: bundle_id.clone() };
     let parsed = parse_ws_url(&url)?;
     if parsed.host.ends_with(".onion") {
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &bundle_id, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
         run_fetch_bundle_ws(ws, frame, request_id, bundle_id).await
@@ -725,7 +752,7 @@ pub async fn retire_mailbox_once(
     validate_token(&delivery_token, "delivery token")?;
     let parsed = parse_ws_url(&url)?;
     if parsed.host.ends_with(".onion") {
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &recipient_id, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
         run_retire_mailbox_ws(ws, recipient_id, auth_token, delivery_token).await
@@ -877,7 +904,7 @@ async fn run_connection(
         if parsed.scheme != "ws" {
             return Err("onion WebSocket URLs must use ws:// because Tor already provides the transport privacy; wss:// onion TLS is not implemented yet".into());
         }
-        let stream = connect_onion_stream_with_retries(tor_client.clone(), &parsed.host, parsed.port).await?;
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &recipient_id, &parsed.host, parsed.port).await?;
         let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
         let (ws, _) = client_async(request, stream)
             .await

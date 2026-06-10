@@ -18,6 +18,7 @@ use std::{collections::{HashMap, HashSet}, fs, io::Write, path::PathBuf, sync::A
 
 use base64::{engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD}, Engine as _};
 use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use libsignal_protocol::{KeyPair, PrivateKey, PublicKey};
@@ -28,7 +29,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::{identity::{fingerprint, remove_consumed_opks_and_replenish, reseal_vault, rotate_signed_prekey_if_due, EncryptedIdentity, OpkSecret, SignedPreKeySecret}, load_vault, read_unified_message_store, save_vault, transport, update_unified_message_store, AppSessionState};
+use crate::{identity::{fingerprint, remove_consumed_opks_and_replenish, reseal_vault, rotate_signed_prekey_if_due, EncryptedIdentity, OpkSecret, SignedPreKeySecret}, load_vault, read_unified_message_store, save_vault, transport, AppSessionState};
 
 const INVITE_PREFIX: &str = "axn1_";
 const STORE_FILE: &str = "messages.store";
@@ -55,16 +56,30 @@ const MAX_MESSAGES_PER_CONTACT: usize = 10_000;
 pub struct MessagingRuntimeState {
     seen_envelopes: Arc<Mutex<HashMap<String, u64>>>,
     failed_envelopes: Arc<Mutex<HashMap<String, FailedEnvelopeEntry>>>,
+    /// False until the first snapshot of the session has run the one-time
+    /// recovery sweep (relay_pending -> send_failed for sends a prior process
+    /// owned). Gating that sweep to the first snapshot stops later snapshots —
+    /// which the UI triggers on every incoming message — from racing and
+    /// flipping a still-in-flight send to "failed".
+    startup_recovery_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FailedEnvelopeEntry { count: u32, last_seen_ms: u64 }
+struct FailedEnvelopeEntry { count: u32, first_seen_ms: u64, last_seen_ms: u64 }
 
 impl MessagingRuntimeState { pub fn new() -> Self { Self::default() } }
 
 const SEEN_ENVELOPE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_SEEN_ENVELOPES: usize = 4096;
 const MAX_FAILED_DECRYPTS_PER_ENVELOPE: u32 = 5;
+/// An envelope is only treated as un-decryptable poison (acked and discarded)
+/// once it has been failing for at least this long, in addition to exceeding the
+/// failure count. Signal decryption is deterministic given the local store, but
+/// the store legitimately changes as sessions establish (e.g. a route_sync/prekey
+/// message that was queued behind this one); the time gate gives that a chance to
+/// land so a burst of fast reconnects cannot exhaust the retry budget and drop a
+/// message that would have become decryptable.
+const MIN_POISON_AGE_MS: u64 = 10 * 60 * 1000;
 const DELIVERY_TOKEN_FALLBACK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,7 +253,11 @@ pub struct KyberPreKeyBlob {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignedVerificationPayload {
-    payload: VerificationPayload,
+    /// The exact serialized `VerificationPayload` bytes that were signed, base64
+    /// (STANDARD_NO_PAD). Signing and verifying over these transmitted bytes —
+    /// rather than re-serializing a parsed struct — keeps verification robust if
+    /// `VerificationPayload`'s fields ever change between client versions.
+    payload_b64: String,
     signature_b64: String,
 }
 
@@ -351,8 +370,15 @@ struct SealedSignalWireMessage {
 }
 
 /// Pad raw ciphertext to fixed bucket sizes so the relay cannot infer message
-/// length from the wire size. Buckets: 512, 1024, 2048, 4096, 8192, 16384, 32768.
+/// length from the wire size. Buckets: 512, 1024, 2048, 4096, 8192, 16384, 32768,
+/// 65536. Payloads larger than the top bucket are sent at their exact size.
 /// Padding bytes are random noise appended after a 4-byte big-endian length prefix.
+///
+/// Note: this padding wraps the already-sealed ciphertext and is therefore
+/// OUTSIDE the AEAD. A malicious relay can tamper with the length prefix or the
+/// padding, but the only achievable effect is a failed unpad/decrypt (a relay can
+/// drop messages regardless), never disclosure — the sealed-sender envelope below
+/// is integrity-protected independently.
 fn pad_ciphertext(raw: &[u8]) -> Result<Vec<u8>, String> {
     const BUCKETS: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
     let total_needed = 4 + raw.len(); // 4-byte length prefix + payload
@@ -370,13 +396,24 @@ fn pad_ciphertext(raw: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Remove padding added by pad_ciphertext, returning the original ciphertext.
+///
+/// `pad_ciphertext` always produces a frame whose total length is either one of
+/// the fixed bucket sizes or exactly `4 + payload_len` (when the payload exceeded
+/// every bucket). Requiring the input to match that shape prevents a legacy,
+/// never-padded ciphertext whose leading 4 bytes happen to look like a length
+/// prefix from being silently truncated — the caller falls back to the raw bytes
+/// instead. (A real padded frame always matches, so this never rejects one.)
 fn unpad_ciphertext(padded: &[u8]) -> Result<Vec<u8>, String> {
+    const BUCKETS: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
     if padded.len() < 4 {
         return Err("padded ciphertext too short".into());
     }
     let len = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
     if 4 + len > padded.len() {
         return Err("padded ciphertext length prefix exceeds data".into());
+    }
+    if 4 + len != padded.len() && !BUCKETS.contains(&padded.len()) {
+        return Err("padded ciphertext length does not match any padding bucket".into());
     }
     Ok(padded[4..4 + len].to_vec())
 }
@@ -643,6 +680,67 @@ fn decode_store_file(path: &PathBuf, data: &[u8]) -> Result<EncryptedStoreFile, 
     }
 }
 
+// ── In-memory message-store cache ──────────────────────────────────────────
+//
+// The encrypted `messages.store` blob holds the entire contact/message/session
+// state. Without a cache, every store operation re-read the file, ChaCha-decrypted
+// it, and JSON-parsed it in full — and the UI triggers a `snapshot` (a store read)
+// on every incoming message, so a single message used to pay several full
+// decrypt+parse passes over the whole history. That cost grows with history and
+// was the dominant source of per-message lag.
+//
+// This cache keeps the decrypted store resident, keyed by the active store key, so
+// reads are a memory clone instead of disk + AEAD + JSON. It is a write-through
+// cache: `save_store_with_key` updates it after every durable write, so it can
+// never serve state older than what is on disk. All store mutations already
+// serialize on `AppSessionState::messaging_store_lock`, and the cache is keyed by
+// the store key (so a passphrase change or a different identity simply misses and
+// reloads). The only lock-free callers are read-only (inspect/load settings), for
+// which a momentarily stale clone is harmless.
+//
+// Security: this keeps plaintext store material (which includes Signal session
+// records and route keys) resident for the whole unlocked session rather than
+// only per-operation. That matches the existing exposure of the unlocked vault
+// secrets/KEK, and the cache is cleared on lock, passphrase change, and identity
+// creation. Device-compromise while unlocked remains out of scope.
+struct CachedStore {
+    key: [u8; 32],
+    store: MessagingStore,
+}
+
+impl Drop for CachedStore {
+    fn drop(&mut self) {
+        // The store key is the most sensitive resident byte string here; wipe it.
+        // The decrypted store struct is large/owned and dropped normally.
+        self.key.zeroize();
+    }
+}
+
+fn store_cache() -> &'static std::sync::Mutex<Option<CachedStore>> {
+    static STORE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedStore>>> = std::sync::OnceLock::new();
+    STORE_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn store_cache_get(key: &[u8; 32]) -> Option<MessagingStore> {
+    let guard = store_cache().lock().unwrap_or_else(|p| p.into_inner());
+    match guard.as_ref() {
+        Some(cached) if &cached.key == key => Some(cached.store.clone()),
+        _ => None,
+    }
+}
+
+fn store_cache_set(key: &[u8; 32], store: &MessagingStore) {
+    let mut guard = store_cache().lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(CachedStore { key: *key, store: store.clone() });
+}
+
+/// Drop the cached decrypted store and its resident key. Call when the active key
+/// becomes invalid or the app locks: lock, passphrase change, identity creation.
+pub fn clear_store_cache() {
+    let mut guard = store_cache().lock().unwrap_or_else(|p| p.into_inner());
+    *guard = None;
+}
+
 fn try_load_store_with_key(app: &AppHandle, key_bytes: &[u8; 32]) -> Result<MessagingStore, String> {
     let path = store_path(app)?;
     let data = if path.exists() {
@@ -663,28 +761,68 @@ fn try_load_store_with_key(app: &AppHandle, key_bytes: &[u8; 32]) -> Result<Mess
 }
 
 fn load_store_with_keys(app: &AppHandle, current_key: &[u8; 32], legacy_key: &[u8; 32]) -> Result<MessagingStore, String> {
+    // Serve from the in-memory cache when it holds state for this exact key. This
+    // is the hot path: it skips the file read, AEAD decrypt, and JSON parse that
+    // every store operation would otherwise repeat over the entire history.
+    if let Some(store) = store_cache_get(current_key) {
+        return Ok(store);
+    }
+    let store = load_store_uncached(app, current_key, legacy_key)?;
+    store_cache_set(current_key, &store);
+    Ok(store)
+}
+
+fn load_store_uncached(app: &AppHandle, current_key: &[u8; 32], legacy_key: &[u8; 32]) -> Result<MessagingStore, String> {
+    // Recover an interrupted passphrase change first: a rekey sidecar that
+    // decrypts under the current key is the authoritative post-change store.
+    if let Some(store) = try_promote_rekey_sidecar(app, current_key)? {
+        return Ok(store);
+    }
     match try_load_store_with_key(app, current_key) {
         Ok(store) => Ok(store),
         Err(current_err) => {
-            if current_key == legacy_key {
-                return Err(format!("message store could not be decrypted; identity/password mismatch or corrupted store: {current_err}"));
-            }
-            match try_load_store_with_key(app, legacy_key) {
-                Ok(store) => {
-                    // One-time legacy migration: if an old raw-KEK store is readable,
-                    // immediately rewrite it under the domain-separated store key so the
-                    // legacy decrypt path is not exercised forever.
+            // Migration ladder for stores written by older builds. Each rung that
+            // succeeds is immediately re-saved under the current HKDF-derived key,
+            // so a legacy decrypt path is exercised at most once per store.
+            //
+            // Rung 1: the pre-HKDF (v1) SHA256 domain-key derivation.
+            let v1_key = legacy_domain_key_v1(legacy_key, b"message-store");
+            if &v1_key != current_key {
+                if let Ok(store) = try_load_store_with_key(app, &v1_key) {
                     save_store_with_key(app, &store, current_key)?;
-                    Ok(store)
+                    return Ok(store);
                 }
-                Err(_) => Err("message store could not be decrypted; identity/password mismatch or corrupted store".to_string()),
             }
+            // Rung 2: the oldest stores were encrypted with the raw KEK directly.
+            if legacy_key != current_key {
+                if let Ok(store) = try_load_store_with_key(app, legacy_key) {
+                    save_store_with_key(app, &store, current_key)?;
+                    return Ok(store);
+                }
+            }
+            Err(format!("message store could not be decrypted; identity/password mismatch or corrupted store: {current_err}"))
         }
     }
 }
 
 fn save_store_with_key(app: &AppHandle, store: &MessagingStore, key_bytes: &[u8; 32]) -> Result<(), String> {
     let path = store_path(app)?;
+    encrypt_and_write_store(&path, store, key_bytes)?;
+    // Write-through: refresh the cache only after the durable write succeeds, so
+    // the cache can never be ahead of disk.
+    store_cache_set(key_bytes, store);
+    Ok(())
+}
+
+/// Encrypt `store` under `key_bytes` and atomically write it to `path`.
+///
+/// `messages.store` is the single source of truth for the message/contact store.
+/// The store is no longer mirrored into `axeno.state` on every save — that
+/// duplicated the entire (potentially multi-MB) encrypted blob and added a second
+/// fsync to the hot path of every received/sent message. `axeno.state` still
+/// holds the identity vault and any pre-existing message mirror is read once for
+/// migration, but writes go only here now.
+fn encrypt_and_write_store(path: &PathBuf, store: &MessagingStore, key_bytes: &[u8; 32]) -> Result<(), String> {
     // Never reuse one fixed tmp path. During local two-instance testing, overlapping writes to the
     // same messages.store.tmp can leave concatenated/trailing JSON and trigger Serde's
     // "trailing characters" error. A unique tmp file plus atomic rename avoids that class of bug.
@@ -712,7 +850,7 @@ fn save_store_with_key(app: &AppHandle, store: &MessagingStore, key_bytes: &[u8;
         f.write_all(&encoded).map_err(|e| format!("write message store failed: {e}"))?;
         f.sync_all().map_err(|e| format!("fsync message store failed: {e}"))?;
     }
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("rename message store failed: {e}"));
     }
@@ -724,8 +862,53 @@ fn save_store_with_key(app: &AppHandle, store: &MessagingStore, key_bytes: &[u8;
             }
         }
     }
-    update_unified_message_store(app, encoded)?;
     Ok(())
+}
+
+/// Path of the passphrase-change rekey sidecar. During a passphrase change the
+/// store is first re-encrypted under the new key here, then the vault is
+/// committed, then this is promoted over the live store. If the process dies
+/// mid-change, the next unlock recovers whichever side is consistent with the
+/// committed vault (see `try_promote_rekey_sidecar`).
+fn rekey_sidecar_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|_| "could not resolve app data dir".to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create app data dir: {e}"))?;
+    Ok(dir.join(format!("{STORE_FILE}.rekey")))
+}
+
+/// If a rekey sidecar exists and decrypts under `current_key`, it is the
+/// authoritative post-passphrase-change store: promote it over the live store
+/// and return it. A sidecar that does NOT decrypt under the current key belongs
+/// to a passphrase change that aborted *before* the vault was committed, so the
+/// live store is still correct and the sidecar is ignored (left for the next
+/// change attempt to overwrite). Returns `None` when there is nothing to recover.
+fn try_promote_rekey_sidecar(app: &AppHandle, current_key: &[u8; 32]) -> Result<Option<MessagingStore>, String> {
+    let sidecar = rekey_sidecar_path(app)?;
+    if !sidecar.exists() { return Ok(None); }
+    let Ok(data) = fs::read(&sidecar) else { return Ok(None); };
+    let file = match decode_store_file(&sidecar, &data) {
+        Ok(file) => file,
+        Err(_) => { let _ = fs::remove_file(&sidecar); return Ok(None); }
+    };
+    if file.version > 1 { return Ok(None); }
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(current_key));
+    let mut plaintext = match cipher.decrypt(Nonce::from_slice(&file.nonce), file.ciphertext.as_ref()) {
+        Ok(pt) => pt,
+        Err(_) => return Ok(None),
+    };
+    let parsed = serde_json::from_slice::<MessagingStore>(&plaintext)
+        .map_err(|e| format!("rekey sidecar plaintext is corrupted: {e}"));
+    plaintext.zeroize();
+    let parsed = parsed?;
+    let path = store_path(app)?;
+    fs::rename(&sidecar, &path).map_err(|e| format!("could not promote rekey sidecar: {e}"))?;
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) { let _ = dir.sync_all(); }
+        }
+    }
+    Ok(Some(parsed))
 }
 
 
@@ -733,12 +916,26 @@ pub fn derive_store_key_from_root(root_key: &[u8; 32]) -> [u8; 32] {
     derive_domain_key(root_key, b"message-store")
 }
 
-pub fn reencrypt_message_store(app: &AppHandle, old_root_key: &[u8; 32], new_root_key: &[u8; 32]) -> Result<(), String> {
+/// Step 1 of a crash-safe passphrase change: re-encrypt the current store under
+/// the NEW key and write it to the rekey sidecar, leaving the live store (still
+/// readable under the OLD key) untouched. The caller commits the vault next, then
+/// calls [`promote_rekey_sidecar`].
+pub fn reencrypt_message_store_to_sidecar(app: &AppHandle, old_root_key: &[u8; 32], new_root_key: &[u8; 32]) -> Result<(), String> {
     let old_store_key = derive_store_key_from_root(old_root_key);
     let legacy_old_key = *old_root_key;
     let store = load_store_with_keys(app, &old_store_key, &legacy_old_key)?;
     let new_store_key = derive_store_key_from_root(new_root_key);
-    save_store_with_key(app, &store, &new_store_key)
+    let sidecar = rekey_sidecar_path(app)?;
+    encrypt_and_write_store(&sidecar, &store, &new_store_key)
+}
+
+/// Step 3 of a crash-safe passphrase change: promote the rekey sidecar (written
+/// under the new key) over the live store, now that the vault has been committed
+/// under the new passphrase. Idempotent — a no-op if there is no sidecar.
+pub fn promote_rekey_sidecar(app: &AppHandle, new_root_key: &[u8; 32]) -> Result<(), String> {
+    let new_store_key = derive_store_key_from_root(new_root_key);
+    let _ = try_promote_rekey_sidecar(app, &new_store_key)?;
+    Ok(())
 }
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
@@ -770,7 +967,24 @@ fn ensure_route_cert_key(route: &mut LocalRoute) -> Result<(), String> {
     Ok(())
 }
 
+/// Derive a per-purpose subkey from the master vault key using HKDF-SHA256.
+///
+/// HKDF is the right primitive for key separation: the domain tag is the salt
+/// and the purpose `label` is the `info` string, so distinct labels yield
+/// independent keys with no length-extension or concatenation-ambiguity concerns
+/// that a hand-rolled `SHA256(tag || label || key)` construction can have.
 fn derive_domain_key(root_key: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"axeno-domain-separated-key-v1"), root_key);
+    let mut out = [0u8; 32];
+    hk.expand(label, &mut out)
+        .expect("HKDF-SHA256 expand of 32 bytes is always within the output limit");
+    out
+}
+
+/// The pre-HKDF (v1) domain-key derivation. Retained ONLY so a message store
+/// written by an older build can be decrypted once and immediately re-saved
+/// under the current HKDF-derived key (see `load_store_with_keys`).
+fn legacy_domain_key_v1(root_key: &[u8; 32], label: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"axeno-domain-separated-key-v1");
     hasher.update(label);
@@ -1457,22 +1671,28 @@ fn prune_failed_envelopes(map: &mut HashMap<String, FailedEnvelopeEntry>, now: u
     for (key, _) in entries.into_iter().take(remove_count) { map.remove(&key); }
 }
 
-fn sign_verification_payload(material: &PrivateSignalMaterial, payload: &VerificationPayload) -> Result<String, String> {
+fn sign_identity_bytes(material: &PrivateSignalMaterial, bytes: &[u8]) -> Result<String, String> {
     let private = PrivateKey::deserialize(&material.identity_priv).map_err(|e| format!("local identity private key is invalid: {e}"))?;
     let mut rng = fresh_signal_rng()?;
-    let bytes = serde_json::to_vec(payload).map_err(|e| format!("could not serialize verification payload: {e}"))?;
-    let sig = private.calculate_signature(&bytes, &mut rng).map_err(|e| format!("could not sign verification code: {e}"))?;
+    let sig = private.calculate_signature(bytes, &mut rng).map_err(|e| format!("could not sign verification code: {e}"))?;
     Ok(STANDARD_NO_PAD.encode(sig))
 }
 
-fn verify_verification_payload_signature(payload: &VerificationPayload, signature_b64: &str) -> Result<(), String> {
-    let remote_public = PublicKey::deserialize(&decode_b64(&payload.local_identity_public_b64, "verification signer identity public key")?)
+/// Verify a signed verification code over its exact transmitted bytes, then parse
+/// it. The signature is checked against the identity claimed *inside* the payload
+/// over the raw `payload_b64` bytes, so a later struct change cannot silently
+/// invalidate signatures via a re-serialization mismatch.
+fn verify_and_parse_verification_payload(signed: &SignedVerificationPayload) -> Result<VerificationPayload, String> {
+    let raw = decode_b64(&signed.payload_b64, "verification payload")?;
+    let payload: VerificationPayload = serde_json::from_slice(&raw)
+        .map_err(|e| format!("verification payload is invalid: {e}"))?;
+    let signer = PublicKey::deserialize(&decode_b64(&payload.local_identity_public_b64, "verification signer identity public key")?)
         .map_err(|e| format!("verification signer public key is invalid: {e}"))?;
-    let sig = decode_b64(signature_b64, "verification signature")?;
-    let bytes = serde_json::to_vec(payload).map_err(|e| format!("could not serialize verification payload: {e}"))?;
-    let ok = remote_public.verify_signature(&bytes, &sig);
-    if !ok { return Err("verification code signature did not match the claimed identity".to_string()); }
-    Ok(())
+    let sig = decode_b64(&signed.signature_b64, "verification signature")?;
+    if !signer.verify_signature(&raw, &sig) {
+        return Err("verification code signature did not match the claimed identity".to_string());
+    }
+    Ok(payload)
 }
 
 fn decode_b64(s: &str, label: &str) -> Result<Vec<u8>, String> {
@@ -1713,13 +1933,25 @@ pub async fn generate_connection_code(
         route_for_connect.receive_auth_token.clone(),
         route_for_connect.delivery_token.clone(),
     ).await;
-    transport::upload_invite_bundle(
+    if let Err(e) = transport::upload_invite_bundle(
         tor_client,
         route_for_connect.server_url.clone(),
         bundle_id,
         hosted_ciphertext,
         expires,
-    ).await.map_err(|e| format!("failed to upload invite bundle to relay: {e}"))?;
+    ).await {
+        // The bundle never made it to the relay, so the code we were about to
+        // hand back is unresolvable (peers would get bundle_not_found). Roll back
+        // the persisted pending invite and its route so it does not linger in the
+        // code list looking valid.
+        let _store_guard = session.messaging_store_lock.lock().await;
+        if let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) {
+            store.pending_invites.retain(|p| p.id != response.id);
+            store.local_routes.retain(|r| r.id != route_for_connect.id);
+            let _ = save_store_with_key(&app, &store, &store_key);
+        }
+        return Err(format!("failed to upload invite bundle to relay: {e}"));
+    }
 
     Ok(response)
 }
@@ -1997,16 +2229,24 @@ pub async fn add_contact_from_code(
     Ok(stored)
 }
 
-pub async fn snapshot(app: AppHandle, session: &AppSessionState) -> Result<MessagingSnapshot, String> {
+pub async fn snapshot(app: AppHandle, session: &AppSessionState, runtime: &MessagingRuntimeState) -> Result<MessagingSnapshot, String> {
     let _store_guard = session.messaging_store_lock.lock().await;
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     cleanup_expired_routes(&mut store);
-    // A previous process owned the websocket that could have acknowledged these.
-    // Mark them failed on startup instead of preserving a permanent "sending".
-    for msg in store.messages.iter_mut() {
-        if msg.mine && msg.status == "relay_pending" {
-            msg.status = "send_failed".to_string();
+    // Run the "sends a prior process left in flight are now failed" recovery
+    // exactly once per session, on the first snapshot. The UI calls snapshot on
+    // every incoming message; without this gate a snapshot that overlaps a send
+    // still awaiting its relay ack would flip relay_pending -> send_failed and
+    // persist it, showing a false failure.
+    let first_run = !runtime
+        .startup_recovery_done
+        .swap(true, std::sync::atomic::Ordering::AcqRel);
+    if first_run {
+        for msg in store.messages.iter_mut() {
+            if msg.mine && msg.status == "relay_pending" {
+                msg.status = "send_failed".to_string();
+            }
         }
     }
     let mut grouped: HashMap<String, Vec<StoredMessage>> = HashMap::new();
@@ -2014,7 +2254,13 @@ pub async fn snapshot(app: AppHandle, session: &AppSessionState) -> Result<Messa
     for msgs in grouped.values_mut() { msgs.sort_by_key(|m| (m.timestamp, m.received_at_ms.unwrap_or(m.timestamp))); }
     let my_recipient_ids: Vec<String> = store.local_routes.iter().filter(|r| r.active).map(|r| r.mailbox_id.clone()).collect();
     let my_recipient_id = my_recipient_ids.first().cloned().or_else(|| store.local_profile.as_ref().map(|p| p.mailbox_id.clone())).unwrap_or_default();
-    save_store_with_key(&app, &store, &store_key)?;
+    // Snapshot is a read in the steady state. Only persist on the first run, when
+    // the recovery sweep above may have changed message statuses; otherwise avoid
+    // a full encrypted-store rewrite on every incoming message. Route cleanup is
+    // durably persisted by the connect/handle-incoming paths, not here.
+    if first_run {
+        save_store_with_key(&app, &store, &store_key)?;
+    }
     Ok(MessagingSnapshot { my_recipient_id, my_recipient_ids, contacts: store.contacts, messages: grouped })
 }
 
@@ -2411,7 +2657,10 @@ pub async fn handle_incoming_envelope(
         let mut failed = runtime.failed_envelopes.lock().await;
         let now = now_ms();
         prune_failed_envelopes(&mut failed, now);
-        failed.get(&envelope_key).map(|e| e.count).unwrap_or(0) >= MAX_FAILED_DECRYPTS_PER_ENVELOPE
+        failed.get(&envelope_key)
+            .map(|e| e.count >= MAX_FAILED_DECRYPTS_PER_ENVELOPE
+                && now.saturating_sub(e.first_seen_ms) >= MIN_POISON_AGE_MS)
+            .unwrap_or(false)
     };
     if drop_poisoned_envelope {
         let _ = transport::ack_envelopes(transport_state, server_id.clone(), vec![envelope.id]).await;
@@ -2462,10 +2711,11 @@ pub async fn handle_incoming_envelope(
                 let mut failed = runtime.failed_envelopes.lock().await;
                 let now = now_ms();
                 prune_failed_envelopes(&mut failed, now);
-                let entry = failed.entry(envelope_key.clone()).or_insert(FailedEnvelopeEntry { count: 0, last_seen_ms: now });
+                let entry = failed.entry(envelope_key.clone()).or_insert(FailedEnvelopeEntry { count: 0, first_seen_ms: now, last_seen_ms: now });
                 entry.count = entry.count.saturating_add(1);
                 entry.last_seen_ms = now;
                 entry.count >= MAX_FAILED_DECRYPTS_PER_ENVELOPE
+                    && now.saturating_sub(entry.first_seen_ms) >= MIN_POISON_AGE_MS
             };
             if should_drop_poisoned_envelope {
                 drop(store);
@@ -2761,9 +3011,10 @@ pub async fn verification_code_for_contact(app: AppHandle, session: &AppSessionS
         safety_number: contact.safety_number.clone(),
         created_at_ms: created_at,
     };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("could not serialize verification payload: {e}"))?;
     let signed = SignedVerificationPayload {
-        signature_b64: sign_verification_payload(&material, &payload)?,
-        payload,
+        signature_b64: sign_identity_bytes(&material, &payload_bytes)?,
+        payload_b64: STANDARD_NO_PAD.encode(&payload_bytes),
     };
     let code = verification_payload_to_code(&signed)?;
     Ok(VerificationCodeResponse { code, safety_number: contact.safety_number.clone(), created_at })
@@ -2773,14 +3024,15 @@ pub async fn verify_contact_with_code(app: AppHandle, session: &AppSessionState,
     let trimmed = code.trim().to_string();
     if trimmed.is_empty() { return Err("verification code is empty".into()); }
     let signed = code_to_verification_payload(&trimmed)?;
-    let payload = signed.payload;
+    // Verifies the signature over the exact transmitted bytes before we trust any
+    // field in the payload.
+    let payload = verify_and_parse_verification_payload(&signed)?;
     if payload.v != 1 || payload.kind != "axeno_verify_v1" {
         return Err("unsupported verification code".into());
     }
     if payload.created_at_ms.saturating_add(VERIFY_CODE_TTL_MS) < now_ms() {
         return Err("verification code has expired; ask them to generate a fresh one".into());
     }
-    verify_verification_payload_signature(&payload, &signed.signature_b64)?;
 
     let _store_guard = session.messaging_store_lock.lock().await;
     let (store_key, legacy_store_key) = store_keys(session).await?;
@@ -3651,6 +3903,25 @@ mod route_tests {
             created_at_ms: now_ms(),
             last_read_at: None,
         }
+    }
+
+    #[test]
+    fn store_cache_serves_by_key_and_clears() {
+        let key_a = [7u8; 32];
+        let key_b = [9u8; 32];
+        clear_store_cache();
+        assert!(store_cache_get(&key_a).is_none(), "empty cache misses");
+
+        let mut store = MessagingStore::default();
+        store.contacts.push(test_contact("c1", "ws://relay.onion/ws", None));
+        store_cache_set(&key_a, &store);
+
+        let hit = store_cache_get(&key_a).expect("hit under the same key");
+        assert_eq!(hit.contacts.len(), 1);
+        assert!(store_cache_get(&key_b).is_none(), "a different key misses");
+
+        clear_store_cache();
+        assert!(store_cache_get(&key_a).is_none(), "cleared cache misses");
     }
 
     #[test]

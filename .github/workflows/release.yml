@@ -121,23 +121,29 @@ jobs:
             build-essential \
             libssl-dev \
             pkg-config \
-            protobuf-compiler \
             xdg-utils
 
-      # libsignal's spqr crate compiles .proto files with prost-build, which
-      # shells out to `protoc`. Not preinstalled on macOS/Windows runners.
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      # libsignal's spqr crate compiles .proto files with prost-build, which shells
+      # out to `protoc`. Install it through the maintained, token-authenticated
+      # action on every platform that has a native protoc release. This replaces
+      # the manual GitHub-release download whose CDN 504'd; the token also avoids
+      # anonymous API rate limits. It covers Linux x64/arm64, macOS x64/arm64, and
+      # Windows x64.
+      - name: Install protoc
+        if: matrix.slug != 'windows-aarch64'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
+      # protobuf publishes no native Windows/ARM64 build, so the ARM runner uses the
+      # x64 protoc under emulation. Kept as a small retrying manual download.
+      - name: Install protoc (Windows ARM, emulated x64)
+        if: matrix.slug == 'windows-aarch64'
         shell: pwsh
         run: |
           $ver = "28.3"
           $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip"
           $dest = "$env:RUNNER_TEMP\protoc.zip"
-          # The GitHub release CDN occasionally 504s; retry instead of failing the build.
           for ($i = 1; $i -le 5; $i++) {
             try { Invoke-WebRequest -Uri $url -OutFile $dest; break }
             catch {
@@ -166,7 +172,15 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build, sign, and upload to the release
+      # The AppImage bundler downloads linuxdeploy/AppRun from GitHub's release CDN
+      # at bundle time, which intermittently returns 504. That download lives inside
+      # tauri-action and can't be retried in place, so the whole build step is run
+      # with one automatic retry: the first attempt is allowed to fail, and on
+      # failure a second attempt runs after a short backoff. Cargo output is cached
+      # between attempts, so the retry only re-runs bundling/upload, not the compile.
+      - name: Build, sign, and upload to the release (attempt 1)
+        id: build1
+        continue-on-error: true
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,6 +189,24 @@ jobs:
           # linuxdeploy ships as an AppImage and needs FUSE to mount itself, which
           # GitHub runners lack. Extract-and-run avoids FUSE so AppImage bundling
           # works. No-op on macOS/Windows.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      - name: Back off before retry
+        if: steps.build1.outcome == 'failure'
+        shell: bash
+        run: sleep 45
+
+      - name: Build, sign, and upload to the release (retry)
+        if: steps.build1.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}

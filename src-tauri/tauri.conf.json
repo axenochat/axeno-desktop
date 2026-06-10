@@ -23,7 +23,7 @@
     "security": {
       "csp": {
         "default-src": "'self' customprotocol: asset:",
-        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 http://127.0.0.1:1420 ws://127.0.0.1:8787 ws://localhost:8787",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 http://127.0.0.1:1420",
         "img-src": "'self' asset: http://asset.localhost data:",
         "style-src": "'self'",
         "script-src": "'self'"

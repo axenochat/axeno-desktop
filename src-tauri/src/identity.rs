@@ -182,8 +182,22 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+// Upper bounds on the on-disk Argon2 parameters. The lower bound keeps the KDF
+// strong; the upper bound prevents a tampered vault from turning unlock into a
+// memory/CPU exhaustion DoS by claiming absurd cost parameters. 1 GiB / t=16 /
+// p=16 is far above any value this client writes (64 MiB / t=3 / p=1).
+const ARGON2_MAX_MEM_KIB: u32 = 1_048_576;
+const ARGON2_MAX_ITERATIONS: u32 = 16;
+const ARGON2_MAX_PARALLELISM: u32 = 16;
+
 fn derive_key_with_params(passphrase: &str, salt: &[u8; 32], params_on_disk: &Argon2ParamsOnDisk) -> Result<DerivedKey, IdentityError> {
-    if params_on_disk.m_kib < 19_456 || params_on_disk.t == 0 || params_on_disk.p == 0 {
+    if params_on_disk.m_kib < 19_456
+        || params_on_disk.m_kib > ARGON2_MAX_MEM_KIB
+        || params_on_disk.t == 0
+        || params_on_disk.t > ARGON2_MAX_ITERATIONS
+        || params_on_disk.p == 0
+        || params_on_disk.p > ARGON2_MAX_PARALLELISM
+    {
         return Err(IdentityError::Kdf("unsupported Argon2 parameters in vault".to_string()));
     }
     let params = Params::new(
@@ -235,13 +249,31 @@ fn decrypt_vault(
         .map_err(|_| IdentityError::Decrypt)
 }
 
+/// True if the public key derived from `private_bytes` equals `public_bytes`.
+///
+/// `KeyPair::from_public_and_private` only *parses* both halves; it does NOT
+/// check that they form a real keypair. Relying on it would let an attacker with
+/// write access to the vault file swap the (unencrypted) public shell for one of
+/// their own keys while the encrypted private half is untouched. Deriving the
+/// public key from the private scalar and comparing closes that gap.
+fn private_matches_public(public_bytes: &[u8], private_bytes: &[u8]) -> Result<bool, IdentityError> {
+    let private = PrivateKey::deserialize(private_bytes).map_err(|e| IdentityError::Signal(e.to_string()))?;
+    let derived = private.public_key().map_err(|e| IdentityError::Signal(e.to_string()))?;
+    Ok(derived.serialize().as_ref() == public_bytes)
+}
+
 fn verify_unlocked_consistency(blob: &EncryptedIdentity, secrets: &VaultSecrets) -> Result<(), IdentityError> {
     // Public shell data is outside the AEAD ciphertext for backwards compatibility,
     // so validate that it still matches the decrypted private material on unlock.
+    // Each check derives the public key from the encrypted private half and
+    // compares it to the unencrypted shell, so a tampered shell key is rejected.
     let identity_pub = PublicKey::deserialize(&blob.public_key).map_err(|e| IdentityError::Signal(e.to_string()))?;
-    PrivateKey::deserialize(&secrets.identity_priv).map_err(|e| IdentityError::Signal(e.to_string()))?;
-    KeyPair::from_public_and_private(&blob.signed_prekey_public, &secrets.spk_priv)
-        .map_err(|e| IdentityError::Signal(e.to_string()))?;
+    if !private_matches_public(&blob.public_key, &secrets.identity_priv)? {
+        return Err(IdentityError::Signal("vault identity public key does not match its private key".to_string()));
+    }
+    if !private_matches_public(&blob.signed_prekey_public, &secrets.spk_priv)? {
+        return Err(IdentityError::Signal("vault signed prekey public key does not match its private key".to_string()));
+    }
     // Authenticate the (unencrypted) signed prekey against the identity key so an
     // attacker with write access to the vault file cannot swap or downgrade the
     // signed prekey shell without detection.
@@ -251,8 +283,9 @@ fn verify_unlocked_consistency(blob: &EncryptedIdentity, secrets: &VaultSecrets)
     for previous in &blob.previous_signed_prekeys {
         let secret = secrets.previous_spks_secret.iter().find(|s| s.id == previous.id)
             .ok_or_else(|| IdentityError::Signal(format!("missing private previous signed prekey {}", previous.id)))?;
-        KeyPair::from_public_and_private(&previous.public_key, &secret.private_key)
-            .map_err(|e| IdentityError::Signal(e.to_string()))?;
+        if !private_matches_public(&previous.public_key, &secret.private_key)? {
+            return Err(IdentityError::Signal(format!("previous signed prekey {} public key does not match its private key", previous.id)));
+        }
         if !identity_pub.verify_signature(&previous.public_key, &previous.signature) {
             return Err(IdentityError::Signal(format!("previous signed prekey {} signature does not match identity key", previous.id)));
         }
@@ -261,8 +294,9 @@ fn verify_unlocked_consistency(blob: &EncryptedIdentity, secrets: &VaultSecrets)
     for public in &blob.opks_public {
         let secret = secrets.opks_secret.iter().find(|s| s.id == public.id)
             .ok_or_else(|| IdentityError::Signal(format!("missing private one-time prekey {}", public.id)))?;
-        KeyPair::from_public_and_private(&public.public_key, &secret.private_key)
-            .map_err(|e| IdentityError::Signal(e.to_string()))?;
+        if !private_matches_public(&public.public_key, &secret.private_key)? {
+            return Err(IdentityError::Signal(format!("one-time prekey {} public key does not match its private key", public.id)));
+        }
     }
     Ok(())
 }
@@ -486,7 +520,12 @@ pub fn rotate_signed_prekey_if_due(
     max_age_ms: u64,
 ) -> Result<bool, IdentityError> {
     let now = current_time_ms();
-    if blob.signed_prekey_created_at_ms != 0 && now.saturating_sub(blob.signed_prekey_created_at_ms) < max_age_ms {
+    // A created-at timestamp in the future (clock skew, or a tampered shell field)
+    // would make `now - created` saturate to 0 and freeze rotation forever. Only
+    // treat a non-future, recent timestamp as "not yet due"; anything in the
+    // future falls through and rotates immediately.
+    let created = blob.signed_prekey_created_at_ms;
+    if created != 0 && created <= now && now.saturating_sub(created) < max_age_ms {
         return Ok(false);
     }
     blob.previous_signed_prekeys.push(SignedPreKeyPublic {
@@ -608,6 +647,46 @@ mod tests {
         assert!(unlock_identity(&created.blob, "old").is_err());
         let unlocked = unlock_identity(&created.blob, "new").unwrap();
         assert_eq!(unlocked.secrets.display_name, "Alice");
+    }
+
+    #[test]
+    fn swapped_public_shell_key_is_rejected() {
+        // An attacker with write access swaps the unencrypted identity public key
+        // for one from a different identity, leaving the encrypted secrets intact.
+        // The AEAD still decrypts (the shell is outside the ciphertext), so this
+        // must be caught by the public/private consistency check.
+        let mut victim = create_identity("pw", "Alice").unwrap();
+        let attacker = create_identity("pw2", "Mallory").unwrap();
+        victim.blob.public_key = attacker.blob.public_key.clone();
+        let err = unlock_identity(&victim.blob, "pw").unwrap_err();
+        assert!(matches!(err, IdentityError::Signal(_)));
+    }
+
+    #[test]
+    fn swapped_signed_prekey_shell_is_rejected() {
+        let mut victim = create_identity("pw", "Alice").unwrap();
+        let attacker = create_identity("pw2", "Mallory").unwrap();
+        victim.blob.signed_prekey_public = attacker.blob.signed_prekey_public.clone();
+        let err = unlock_identity(&victim.blob, "pw").unwrap_err();
+        assert!(matches!(err, IdentityError::Signal(_)));
+    }
+
+    #[test]
+    fn absurd_kdf_params_are_rejected() {
+        let mut created = create_identity("pw", "Alice").unwrap();
+        created.blob.kdf_params.m_kib = 8 * 1_048_576; // 8 GiB — DoS territory
+        let err = unlock_identity(&created.blob, "pw").unwrap_err();
+        assert!(matches!(err, IdentityError::Kdf(_)));
+    }
+
+    #[test]
+    fn future_signed_prekey_timestamp_still_rotates() {
+        let mut created = create_identity("pw", "Alice").unwrap();
+        let mut secrets = unlock_identity(&created.blob, "pw").unwrap().secrets;
+        // A shell timestamp far in the future must not freeze rotation.
+        created.blob.signed_prekey_created_at_ms = current_time_ms().saturating_add(10 * 365 * 24 * 60 * 60 * 1000);
+        let rotated = rotate_signed_prekey_if_due(&mut created.blob, &mut secrets, 7 * 24 * 60 * 60 * 1000).unwrap();
+        assert!(rotated);
     }
 
     #[test]
