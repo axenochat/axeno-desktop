@@ -2,7 +2,7 @@
 
 Axeno is a private desktop messenger. It uses the Signal Protocol for end-to-end encryption and routes traffic through Tor. There are no accounts, phone numbers, or email addresses; you add contacts by exchanging one-time connection codes.
 
-This repository is the **desktop client**, built with [Tauri](https://tauri.app) (Rust backend, React frontend). It connects to a self-hosted Rust relay — see [**axeno-relay**](https://github.com/axenochat/axeno-relay) to run one.
+This repository is the **desktop client**, built with [Tauri](https://tauri.app) (Rust backend, React frontend). It connects to a self-hosted Rust relay. See [**axeno-relay**](https://github.com/axenochat/axeno-relay) to run one.
 
 > **Status:** early development, not independently audited. Do not rely on it where your safety is at stake.
 
@@ -20,9 +20,9 @@ This repository is the **desktop client**, built with [Tauri](https://tauri.app)
 
 Download the latest build for your platform from the [Releases](https://github.com/axenochat/axeno-desktop/releases) page:
 
-- **macOS** — `.dmg` (Apple Silicon or Intel)
-- **Windows** — `-setup.exe` (x64 or ARM64)
-- **Linux** — `.AppImage` (x86_64 or aarch64; requires FUSE / `libfuse2`)
+- **macOS**: `.dmg` (Apple Silicon or Intel)
+- **Windows**: `-setup.exe` (x64 or ARM64)
+- **Linux**: `.AppImage` (x86_64 or aarch64; requires FUSE / `libfuse2`)
 
 The app checks for updates on launch and prompts before installing a new signed release. You can disable the check in **Settings → About → Check for updates** (the check is a direct, non-Tor request to GitHub).
 
@@ -32,7 +32,7 @@ Requirements:
 
 - Rust, stable toolchain ([rustup](https://rustup.rs))
 - Node.js 18 or newer
-- `protoc` (Protocol Buffers compiler) — `apt install protobuf-compiler`, `brew install protobuf`, etc.
+- `protoc` (Protocol Buffers compiler): `apt install protobuf-compiler`, `brew install protobuf`, etc.
 - The [Tauri v2 system dependencies](https://tauri.app/start/prerequisites/) for your platform
 
 ```bash
