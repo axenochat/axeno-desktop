@@ -16,6 +16,7 @@ interface Props {
   myInitials: string;
   myDisplayName: string;
   torStatus: "connecting" | "connected" | "failed"; // NEW
+  syncing: boolean;
 }
 
 interface ContextMenuState {
@@ -30,7 +31,7 @@ const MENU_HEIGHT = 132;
 export default function Sidebar({
   contacts, allMessages, activeContactId, onSelectContact, onDeleteContact, onBlockContact,
   onOpenAddContact, onOpenSettings,
-  myInitials, myDisplayName, torStatus
+  myInitials, myDisplayName, torStatus, syncing
 }: Props) {
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
@@ -94,6 +95,13 @@ export default function Sidebar({
         <span className="sidebar-search-icon"><IconSearch /></span>
         <input type="text" placeholder="Search" className="sidebar-search-input" value={query} onChange={e => setQuery(e.target.value)} />
       </div>
+
+      {syncing && (
+        <div className="sidebar-sync" role="status" aria-live="polite">
+          <span className="sidebar-sync-spinner" />
+          <span className="sidebar-sync-text">Syncing messages…</span>
+        </div>
+      )}
 
       <div className="sidebar-list">
         {visibleContacts.map((c) => {

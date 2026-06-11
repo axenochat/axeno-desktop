@@ -261,6 +261,39 @@
   50% { opacity: 0.5; transform: scale(0.8); }
   100% { opacity: 1; transform: scale(1); }
 }
+
+/* Non-blocking "syncing messages" banner shown while queued messages replay
+   after a (re)connect. Sits between the search box and the contact list. */
+.sidebar-sync {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border-radius: 8px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.sidebar-sync-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 2px solid var(--text-faint);
+  border-top-color: transparent;
+  animation: sidebar-sync-spin 0.8s linear infinite;
+}
+
+.sidebar-sync-text {
+  font-weight: 500;
+}
+
+@keyframes sidebar-sync-spin {
+  to { transform: rotate(360deg); }
+}
 /* Custom right-click conversation menu */
 .context-menu-backdrop {
   position: fixed;

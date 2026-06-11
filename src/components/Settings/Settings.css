@@ -799,6 +799,34 @@
   gap: 4px;
 }
 
+/* Code string + use-type badge share a row. The badge has flex-shrink: 0 so it
+   stays visible no matter how long the relay address or code string is — the
+   string truncates first. */
+.code-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.code-badge {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.code-badge.single {
+  background: var(--red-900);
+  color: var(--red-100);
+}
+
+.code-badge.multi {
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
 .code-server {
   display: inline-block;
   max-width: 360px;

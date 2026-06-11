@@ -25,6 +25,7 @@ interface SendMessageResponse { message: BackendMessage; }
 interface SendReceiptEvent { server_id: string; id: string; queued: boolean; client_ref?: string | null; }
 interface SendFailedEvent { server_id: string; client_ref?: string | null; code: string; message: string; }
 interface ServerStatusEvent { server_id: string; status: string; reason?: string | null; }
+interface SyncStatusEvent { syncing: boolean; }
 interface BackendPrivateServerSettings { private_servers: { id: string; name: string; onion: string }[]; default_server_url?: string | null; }
 
 function sanitizeSettingsForStorage(settings: AppSettings): AppSettings {
@@ -73,6 +74,13 @@ export default function App() {
   const [activeContactId, setActiveContactId] = useState("");
   const activeContactIdRef = useRef("");
   const reconnectTimersRef = useRef<Record<string, number>>({});
+
+  // Non-blocking "syncing messages" indicator, driven by the backend's
+  // authoritative `axeno-sync-status` event: it reports true while any relay
+  // connection is still delivering its offline backlog (cleared precisely by the
+  // relay's `synced` marker). The cap only guards against a missed event.
+  const [syncing, setSyncing] = useState(false);
+  const syncCapTimerRef = useRef<number | null>(null);
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
       return parseStoredSettings(localStorage.getItem("axeno.settings.v1"));
@@ -106,12 +114,27 @@ export default function App() {
     }).catch(() => {});
   }, [settings.privateServers, settings.defaultServer, appState, serverSettingsLoaded]);
 
+  // Mirror the backend's sync state. The cap is pure defense-in-depth: if a
+  // `syncing: false` event were ever missed, force the indicator off rather than
+  // leave it spinning forever. The backend self-heals (every connection clears
+  // its flag on the relay's marker, a fallback, or disconnect), so this should
+  // not normally fire.
+  const applySyncStatus = useCallback((value: boolean) => {
+    if (syncCapTimerRef.current) { window.clearTimeout(syncCapTimerRef.current); syncCapTimerRef.current = null; }
+    if (value) {
+      syncCapTimerRef.current = window.setTimeout(() => { syncCapTimerRef.current = null; setSyncing(false); }, 90000);
+    }
+    setSyncing(value);
+  }, []);
+
   const loadMessaging = useCallback(async () => {
     const snap = await invoke<MessagingSnapshot>("messaging_snapshot");
     const nextContacts = snap.contacts.map(contactFromBackend);
     setContacts(nextContacts);
     setMessages(groupMessages(snap));
     setActiveContactId(prev => prev || nextContacts[0]?.id || "");
+    // connect_all triggers the relay's queued-message replay; the backend emits
+    // axeno-sync-status while that backlog is in flight.
     invoke("messaging_connect_all").catch(() => {});
   }, []);
 
@@ -143,6 +166,8 @@ export default function App() {
     setContacts(prev => prev.map(c => c.id === contactId ? next : c));
   }, []);
 
+  useEffect(() => () => { if (syncCapTimerRef.current) window.clearTimeout(syncCapTimerRef.current); }, []);
+
   const activeContactIdForUi = activeContactId || contacts[0]?.id || "";
 
   useEffect(() => {
@@ -172,7 +197,13 @@ export default function App() {
     const unlistenTor = listen<TorStatusEvent>("tor-status", (event) => {
       setTorStatus(event.payload.status);
       setTorError(event.payload.reason ?? "");
-      if (event.payload.status === "connected") invoke("messaging_connect_all").catch(() => {});
+      if (event.payload.status === "connected") {
+        invoke("messaging_connect_all").catch(() => {});
+      }
+    });
+
+    const unlistenSyncStatus = listen<SyncStatusEvent>("axeno-sync-status", (event) => {
+      applySyncStatus(event.payload.syncing);
     });
 
     const unlistenServerStatus = listen<ServerStatusEvent>("axeno-server-status", (event) => {
@@ -263,6 +294,7 @@ export default function App() {
 
     return () => {
       unlistenTor.then(f => f());
+      unlistenSyncStatus.then(f => f());
       unlistenServerStatus.then(f => f());
       unlistenSendReceipt.then(f => f());
       unlistenSendFailed.then(f => f());
@@ -270,7 +302,7 @@ export default function App() {
       Object.values(reconnectTimersRef.current).forEach(timer => window.clearTimeout(timer));
       reconnectTimersRef.current = {};
     };
-  }, [loadMessaging, loadPrivateServerSettings, markContactRead]);
+  }, [loadMessaging, loadPrivateServerSettings, markContactRead, applySyncStatus]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -423,7 +455,7 @@ export default function App() {
   return (
     <div className="app-root">
       <UpdatePrompt enabled={settings.autoUpdateCheck} updateOverTor={settings.updateOverTor} />
-      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} />
+      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} />
 
       {active ? (
         <ChatView contact={active} messages={messages[active.id] || []} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />

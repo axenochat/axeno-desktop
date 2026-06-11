@@ -4,7 +4,7 @@
 //! short-lived standalone relay requests for opaque invite-bundle upload/fetch.
 //! It only moves opaque envelopes and opaque encrypted bundles.
 
-use std::{collections::HashMap, sync::{Arc, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
 
 use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient};
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -16,7 +16,12 @@ use tor_rtcompat::PreferredRuntime;
 use uuid::Uuid;
 
 const PROTOCOL_MIN_SUPPORTED: u16 = 4;
-const PROTOCOL_VERSION: u16 = 5;
+// v6 adds the `synced` server frame (terminal end-of-backlog marker).
+const PROTOCOL_VERSION: u16 = 6;
+/// If a relay never sends `Synced` (it predates protocol v6), clear this
+/// connection's syncing flag this long after HelloOk so the indicator can't
+/// stick on. A v6 relay sends `Synced` right after the flush, well within this.
+const SYNC_FALLBACK_AFTER_HELLO: Duration = Duration::from_secs(6);
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const ONION_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const ONION_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(150);
@@ -35,6 +40,11 @@ pub struct TransportState {
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
+    /// Connection ids whose offline backlog is still being delivered (from the
+    /// start of the connection attempt until the relay's `Synced` marker, a
+    /// fallback timeout, or disconnect). The frontend shows a "syncing" indicator
+    /// while this set is non-empty.
+    syncing_conns: Arc<Mutex<HashSet<String>>>,
 }
 
 impl TransportState {
@@ -112,12 +122,20 @@ enum ServerFrame {
     BundleUploaded { request_id: String, bundle_id: String, expires_at_ms: u64 },
     Bundle { request_id: String, bundle_id: String, ciphertext: String, expires_at_ms: u64 },
     Envelope { envelope: StoredEnvelope },
+    /// Terminal end-of-backlog marker (relay protocol v6+). See `ServerFrame` in
+    /// the relay's protocol.rs.
+    Synced { count: u64 },
     SendOk { id: Uuid, queued: bool, client_ref: Option<String> },
     SendError { client_ref: Option<String>, code: String, message: String },
     DeliveryTokensSet { request_id: String, active_count: usize },
     AckOk { removed: usize },
     Pong { server_time_ms: u64 },
     Error { code: String, message: String },
+    /// Forward compatibility: any frame type this client does not recognize
+    /// deserializes here and is ignored, instead of failing the whole connection.
+    /// This makes future relay protocol additions non-breaking for old clients.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +143,12 @@ pub struct TransportStatusEvent {
     pub server_id: String,
     pub status: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncStatusEvent {
+    /// True while any connection is still delivering its offline backlog.
+    pub syncing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,11 +222,20 @@ pub async fn connect_server(
     let pending_sends = state.pending_sends.clone();
     let trust_roots = state.server_trust_roots.clone();
     let connections = state.connections.clone();
+    let syncing_conns = state.syncing_conns.clone();
     let task_server_id = server_id.clone();
     tokio::spawn(async move {
         let _ = emit_status(&app_for_task, &task_server_id, "connecting", None);
-        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, trust_roots, task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, Some(ready_tx)).await;
+        // Mark this connection as syncing for its whole lifetime up to the
+        // relay's `Synced` marker (set during the run). The backlog replay spans
+        // the Tor connect + handshake, so marking here — not at HelloOk — keeps
+        // the indicator on through the slow part too.
+        set_conn_syncing(&app_for_task, &syncing_conns, &task_server_id, true).await;
+        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, Some(ready_tx)).await;
         remove_connection_if_same(&connections, &task_server_id, instance_id).await;
+        // Cleanup: if the connection ended before `Synced` (e.g. it failed during
+        // connect), clear its syncing flag so the indicator can't stick.
+        set_conn_syncing(&app_for_task, &syncing_conns, &task_server_id, false).await;
         match result {
             Ok(()) => { let _ = emit_status(&app_for_task, &task_server_id, "disconnected", None); }
             Err(e) => { let _ = emit_status(&app_for_task, &task_server_id, "failed", Some(e)); }
@@ -890,6 +923,7 @@ async fn run_connection(
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
+    syncing_conns: Arc<Mutex<HashSet<String>>>,
     server_id: String,
     url: String,
     recipient_id: String,
@@ -909,13 +943,13 @@ async fn run_connection(
         let (ws, _) = client_async(request, stream)
             .await
             .map_err(|e| format!("onion websocket handshake failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
     } else {
         if !parsed.is_local_dev_host() {
             return Err("direct WebSocket is only allowed for localhost development. Use a .onion server URL for real transport.".into());
         }
         let (ws, _) = connect_async(&url).await.map_err(|e| format!("websocket connect failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
     }
 }
 
@@ -925,6 +959,7 @@ async fn run_websocket<S>(
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
+    syncing_conns: Arc<Mutex<HashSet<String>>>,
     server_id: String,
     recipient_id: String,
     auth_token: String,
@@ -985,8 +1020,19 @@ where
         }
     });
 
+    // Fallback that clears this connection's syncing flag if the relay never
+    // sends `Synced` (a pre-v6 relay). Armed at HelloOk, aborted by `Synced` or
+    // when the connection ends so a stale timer can't clear a later reconnect.
+    let mut sync_fallback: Option<tokio::task::JoinHandle<()>> = None;
+
     while let Some(message) = read.next().await {
-        let message = message.map_err(|e| format!("websocket read failed: {e}"))?;
+        let message = match message {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(h) = sync_fallback.take() { h.abort(); }
+                return Err(format!("websocket read failed: {e}"));
+            }
+        };
         let Message::Text(text) = message else { continue; };
         let frame: ServerFrame = serde_json::from_str(&text).map_err(|e| format!("bad server frame: {e}"))?;
         match frame {
@@ -1012,6 +1058,16 @@ where
                 drop(roots);
                 if let Some(tx) = ready_tx.take() { let _ = tx.send(Ok(())); }
                 let _ = emit_status(&app, &server_id, "ready", None);
+                // Arm the pre-v6 fallback. A v6 relay's `Synced` aborts it.
+                if sync_fallback.is_none() {
+                    let fb_app = app.clone();
+                    let fb_syncing = syncing_conns.clone();
+                    let fb_id = server_id.clone();
+                    sync_fallback = Some(tokio::spawn(async move {
+                        sleep(SYNC_FALLBACK_AFTER_HELLO).await;
+                        set_conn_syncing(&fb_app, &fb_syncing, &fb_id, false).await;
+                    }));
+                }
             }
             ServerFrame::SenderCertificate { request_id, certificate_b64, trust_root_b64, expires_at_ms } => {
                 let mut roots = server_trust_roots.lock().await;
@@ -1062,6 +1118,11 @@ where
                     }
                 });
             }
+            ServerFrame::Synced { .. } => {
+                // The offline backlog for this mailbox is fully delivered.
+                if let Some(h) = sync_fallback.take() { h.abort(); }
+                set_conn_syncing(&app, &syncing_conns, &server_id, false).await;
+            }
             ServerFrame::SendOk { id, queued, client_ref } => {
                 if let Some(ref reference) = client_ref {
                     if let Some(tx) = pending_sends.lock().await.remove(reference) {
@@ -1092,12 +1153,17 @@ where
             ServerFrame::AckOk { .. } => {}
             ServerFrame::Pong { .. } => {}
             ServerFrame::BundleUploaded { .. } | ServerFrame::Bundle { .. } => {}
+            ServerFrame::Unknown => {}
             ServerFrame::Error { code, message } => {
                 if let Some(tx) = ready_tx.take() { let _ = tx.send(Err(format!("{code}: {message}"))); }
                 let _ = emit_status(&app, &server_id, "server_error", Some(format!("{code}: {message}")));
             }
         }
     }
+
+    // Connection ended; stop the fallback so it can't clear a later reconnect's
+    // flag. The connect_server task clears this connection's syncing flag.
+    if let Some(h) = sync_fallback.take() { h.abort(); }
 
     if let Some(tx) = ready_tx.take() { let _ = tx.send(Err("relay connection ended before registration completed".to_string())); }
     writer.abort();
@@ -1115,6 +1181,19 @@ where
 
 fn emit_status(app: &AppHandle, server_id: &str, status: &str, reason: Option<String>) -> Result<(), tauri::Error> {
     app.emit("axeno-server-status", TransportStatusEvent { server_id: server_id.to_string(), status: status.to_string(), reason })
+}
+
+/// Add or remove a connection from the "currently syncing" set and emit the
+/// resulting global syncing state. Idempotent: marking a connection done that
+/// is already absent (e.g. `Synced` then disconnect) is a no-op. The emitted
+/// flag is simply whether the set is non-empty, so the frontend can mirror it.
+async fn set_conn_syncing(app: &AppHandle, syncing_conns: &Arc<Mutex<HashSet<String>>>, conn_id: &str, syncing: bool) {
+    let any = {
+        let mut set = syncing_conns.lock().await;
+        if syncing { set.insert(conn_id.to_string()); } else { set.remove(conn_id); }
+        !set.is_empty()
+    };
+    let _ = app.emit("axeno-sync-status", SyncStatusEvent { syncing: any });
 }
 
 fn now_ms() -> u64 {

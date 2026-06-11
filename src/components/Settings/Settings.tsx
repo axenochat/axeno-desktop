@@ -310,10 +310,14 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
             return (
               <div className="code-item" key={c.id}>
                 <div className="code-main">
-                  <span className="code-string" title={c.code}>{compactConnectionCode(c.code)}</span>
+                  <div className="code-header">
+                    <span className="code-string" title={c.code}>{compactConnectionCode(c.code)}</span>
+                    <span className={`code-badge ${c.reusable ? "multi" : "single"}`}>
+                      {c.reusable ? "MULTI-USE" : "SINGLE-USE"}
+                    </span>
+                  </div>
                   <div className="code-server" title={relayLabel}>
                     Relay: {relayLabel}
-                    {!c.reusable && <span style={{ marginLeft: '8px', padding: '2px 6px', background: 'var(--red-900)', color: 'var(--red-100)', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600 }}>SINGLE-USE</span>}
                   </div>
                 </div>
                 <div className="code-actions">
