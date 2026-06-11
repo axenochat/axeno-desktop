@@ -34,6 +34,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+# arduino/setup-protoc has no Node 24 release yet. Force every JS action onto
+# Node 24 (the runner default from June 16, 2026) so the runtime switch happens
+# on our terms instead of breaking a release build when the default flips.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   create-release:
     name: Create draft release
@@ -43,7 +49,7 @@ jobs:
     steps:
       - name: Create a fresh draft release
         id: mk
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           TAG: ${{ github.ref_name }}
         with:
@@ -107,7 +113,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.platform, 'ubuntu')
@@ -155,7 +161,7 @@ jobs:
           Expand-Archive $dest -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
           "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
 
