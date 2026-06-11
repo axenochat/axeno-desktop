@@ -10,11 +10,17 @@ name: Release
 #   - the `.sig` files and a `latest.json` manifest the in-app updater reads
 #
 # Structure: one `create-release` job makes a single fresh draft release and
-# outputs its id; the build matrix uploads into that release by id. The matrix
-# runs serially (max-parallel: 1) because tauri-action's latest.json update is a
-# read-modify-write on one shared asset and races if jobs run concurrently.
+# outputs its id; the build matrix runs fully in parallel and each job uploads
+# its own uniquely-named bundles and `.sig` files into that release by id.
+# Because each job only touches its own assets, the jobs cannot race. A final
+# `updater-json` job then assembles `latest.json` once from the uploaded `.sig`
+# files. (Letting every build job write `latest.json` itself — the old
+# includeUpdaterJson path — was a read-modify-write on one shared asset and is
+# why the matrix used to run serially.)
 #
 # The release is created as a DRAFT; auto-update goes live once you publish it.
+# The updater URLs use releases/latest/download/, which only resolves once the
+# draft is published, so the new latest.json goes live exactly when you publish.
 #
 # Required repository secrets:
 #   TAURI_SIGNING_PRIVATE_KEY           contents of the minisign private key
@@ -77,7 +83,6 @@ jobs:
     needs: create-release
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - name: Linux x64 (AppImage)
@@ -198,7 +203,9 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          includeUpdaterJson: true
+          # latest.json is assembled once by the updater-json job; if each
+          # parallel build wrote it here they would clobber each other.
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
 
       - name: Back off before retry
@@ -216,5 +223,86 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
+
+  updater-json:
+    name: Assemble latest.json
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Pull the per-platform updater signatures the build matrix uploaded. The
+      # release is still a draft, so this needs the token to see it.
+      - name: Download signatures from the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p sigs
+          gh release download "$TAG" -R "$REPO" --pattern '*.sig' --dir sigs
+          echo "Downloaded signatures:"; ls -1 sigs
+
+      # Build latest.json from the signatures. Each updater artifact (e.g.
+      # Axeno_x64.app.tar.gz) has a sibling .sig; the artifact name maps to a
+      # Tauri updater platform key. The URLs use releases/latest/download/ so
+      # they resolve to whichever release is published. The script fails if any
+      # expected platform is missing, so a partial release never ships a
+      # latest.json that silently breaks auto-update for some users.
+      - name: Generate latest.json
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const repo = process.env.REPO;
+          const tag = process.env.TAG;
+          const version = tag.replace(/^v/, "");
+          const base = `https://github.com/${repo}/releases/latest/download`;
+
+          // Map a signed updater artifact filename to its Tauri updater platform
+          // key(s). tauri-action names these uniquely per arch, so there is no
+          // collision across the matrix.
+          const keysFor = (file) => {
+            if (file.endsWith("_x64.app.tar.gz"))     return ["darwin-x86_64"];
+            if (file.endsWith("_aarch64.app.tar.gz")) return ["darwin-aarch64"];
+            if (file.endsWith("_amd64.AppImage"))     return ["linux-x86_64", "linux-x86_64-appimage"];
+            if (file.endsWith("_aarch64.AppImage"))   return ["linux-aarch64", "linux-aarch64-appimage"];
+            if (file.endsWith("_x64-setup.exe"))      return ["windows-x86_64"];
+            if (file.endsWith("_arm64-setup.exe"))    return ["windows-aarch64"];
+            return [];
+          };
+
+          const platforms = {};
+          for (const sig of fs.readdirSync("sigs").filter((f) => f.endsWith(".sig"))) {
+            const artifact = sig.replace(/\.sig$/, "");
+            const keys = keysFor(artifact);
+            if (keys.length === 0) continue;
+            const signature = fs.readFileSync(path.join("sigs", sig), "utf8").trim();
+            for (const k of keys) platforms[k] = { signature, url: `${base}/${artifact}` };
+          }
+
+          const expected = [
+            "darwin-x86_64", "darwin-aarch64",
+            "linux-x86_64", "linux-aarch64",
+            "windows-x86_64", "windows-aarch64",
+          ];
+          const missing = expected.filter((k) => !platforms[k]);
+          if (missing.length) {
+            console.error(`::error::latest.json is missing platforms: ${missing.join(", ")}`);
+            process.exit(1);
+          }
+
+          const out = { version, notes: "", pub_date: new Date().toISOString(), platforms };
+          fs.writeFileSync("latest.json", JSON.stringify(out, null, 2) + "\n");
+          console.log(JSON.stringify(out, null, 2));
+          NODE
+
+      - name: Upload latest.json to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" -R "$REPO" latest.json --clobber

@@ -1,27 +1,45 @@
 #!/usr/bin/env bash
 #
-# Set the Axeno desktop version everywhere it matters, in one shot:
+# Cut a new Axeno desktop release in one shot:
 #
-#   ./scripts/set-version.sh 0.2.0
+#   ./scripts/create-release.sh 0.2.0
 #
-# Updates:
+# This sets the version everywhere, commits the bump, creates the v<version>
+# tag, and pushes the branch + tag to origin. Pushing the tag triggers the
+# GitHub release workflow, which builds the signed bundles into a DRAFT release
+# for you to review and publish.
+#
+# Version is set in:
 #   - package.json + package-lock.json   (npm version)
 #   - src-tauri/tauri.conf.json          (the version the bundler and updater use)
 #   - src-tauri/Cargo.toml + Cargo.lock
 #
-# It does NOT create the git tag. Review the diff, commit, then:
-#
-#   git tag v<version> && git push origin v<version>
-#
 # The tag must match the version set here: the release workflow builds whatever
 # is in the files, and the in-app updater compares versions by semver.
+#
+# Assumptions: the local checkout is already synced with origin and the working
+# tree is clean. Pass -y / --yes to skip the confirmation prompt.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${1:-}"
+VERSION=""
+ASSUME_YES=0
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) ASSUME_YES=1 ;;
+    -h|--help)
+      echo "usage: $0 <version> [-y]   (e.g. $0 0.2.0)"
+      exit 0 ;;
+    -*) echo "error: unknown option '$arg'" >&2; exit 1 ;;
+    *)
+      if [ -n "$VERSION" ]; then echo "error: unexpected argument '$arg'" >&2; exit 1; fi
+      VERSION="$arg" ;;
+  esac
+done
+
 if [ -z "$VERSION" ]; then
-  echo "usage: $0 <version>   (e.g. $0 0.2.0)" >&2
+  echo "usage: $0 <version> [-y]   (e.g. $0 0.2.0)" >&2
   exit 1
 fi
 if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
@@ -34,6 +52,43 @@ case "$VERSION" in
     echo "WARN: (0.2.0-beta < 0.2.0), which is what the in-app updater compares by." >&2
     ;;
 esac
+
+TAG="v$VERSION"
+
+# ── Pre-flight git checks ──────────────────────────────────────────────────
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "error: not inside a git repository" >&2
+  exit 1
+fi
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ -n "$(git status --porcelain)" ]; then
+  echo "error: working tree is not clean. Commit, stash, or discard changes first." >&2
+  echo "       This script commits only the version bump, so the tree must start clean." >&2
+  exit 1
+fi
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+  echo "error: tag $TAG already exists locally. Pick a new version or delete the tag." >&2
+  exit 1
+fi
+if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists on origin. Pick a new version." >&2
+  exit 1
+fi
+
+echo "About to release $TAG:"
+echo "  - set version to $VERSION in the project files"
+echo "  - commit the bump on branch '$BRANCH'"
+echo "  - create annotated tag $TAG"
+echo "  - push '$BRANCH' and $TAG to origin (this triggers the release build)"
+echo
+if [ "$ASSUME_YES" -ne 1 ]; then
+  printf "Proceed? [y/N] "
+  read -r reply
+  case "$reply" in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "aborted."; exit 1 ;;
+  esac
+fi
 
 echo "==> package.json + package-lock.json"
 npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
@@ -53,10 +108,22 @@ sed -i.bak -E "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" src-tauri/Ca
 rm -f src-tauri/Cargo.toml.bak
 (cd src-tauri && cargo update --package axeno-client --offline --quiet)
 
+echo "==> committing version bump"
+git add -A
+if git diff --cached --quiet; then
+  echo "    (files already at $VERSION; tagging the current commit)"
+else
+  git commit -m "release $TAG" >/dev/null
+fi
+
+echo "==> creating tag $TAG"
+git tag -a "$TAG" -m "Axeno desktop $TAG"
+
+echo "==> pushing branch '$BRANCH' and tag $TAG"
+git push origin "$BRANCH"
+git push origin "$TAG"
+
 echo
-echo "Version set to $VERSION in:"
-echo "  package.json, package-lock.json, src-tauri/tauri.conf.json,"
-echo "  src-tauri/Cargo.toml, src-tauri/Cargo.lock"
-echo
-echo "Next: review the diff, commit, then tag the release:"
-echo "  git tag v$VERSION && git push origin v$VERSION"
+echo "Done. $TAG is pushed; the release workflow is building."
+echo "It publishes a DRAFT release — review and publish it to ship the update:"
+echo "  https://github.com/axenochat/axeno-desktop/releases"
