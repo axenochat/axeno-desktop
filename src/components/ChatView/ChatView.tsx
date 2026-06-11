@@ -25,22 +25,18 @@ function messageStatusLabel(status?: string): string {
 
 export default function ChatView({ contact, messages, onOpenChatSettings, onSendMessage, sendOnEnter, messageTextSize }: Props) {
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
 
-  const send = async () => {
+  const send = () => {
     const text = input.trim();
-    if (!text || sending) return;
-    setSending(true);
+    if (!text) return;
     setSendError("");
     setInput("");
-    try {
-      await onSendMessage(text);
-    } catch (e) {
+    // Fire-and-forget: each message gets its own optimistic bubble with a
+    // per-message status, so an in-flight send must not block typing the next.
+    onSendMessage(text).catch(e => {
       setSendError(typeof e === "string" ? e : "Could not send message");
-    } finally {
-      setSending(false);
-    }
+    });
   };
 
   return (
@@ -96,7 +92,7 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
             className={`chat-send ${input.length > 0 ? "active" : ""}`}
             aria-label="Send message"
             onClick={send}
-            disabled={sending || !input.trim()}
+            disabled={!input.trim()}
           >
             <IconArrowUp />
           </button>
