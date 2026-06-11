@@ -1,6 +1,6 @@
 # Axeno Desktop
 
-Axeno is a private desktop messenger. It uses the Signal Protocol for end-to-end encryption and routes traffic through Tor. There are no accounts, phone numbers, or email addresses; you add contacts by exchanging one-time connection codes.
+Axeno is a private desktop messenger. It uses the Signal Protocol for end-to-end encryption and routes traffic through Tor. There are no accounts, phone numbers, or email addresses; you add contacts by exchanging connection codes.
 
 This repository is the **desktop client**, built with [Tauri](https://tauri.app) (Rust backend, React frontend). It connects to a self-hosted Rust relay. See [**axeno-relay**](https://github.com/axenochat/axeno-relay) to run one.
 
