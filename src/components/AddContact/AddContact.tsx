@@ -120,7 +120,7 @@ export default function AddContact({ onClose, onAdded }: Props) {
                 </button>
               </div>
 
-              {busy && <div className="add-contact-busy-note">Connecting over Tor — this may take a minute…</div>}
+              {busy && <div className="add-contact-busy-note">Connecting over Tor, this may take a minute…</div>}
             </>
           )}
         </div>

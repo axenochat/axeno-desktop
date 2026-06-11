@@ -156,7 +156,7 @@ export default function UpdatePrompt({ enabled, updateOverTor }: { enabled: bool
             <div className="update-progress-track">
               <div className="update-progress-fill" style={{ width: `${progress}%` }} />
             </div>
-            <p className="code-warning-note">{progress}% — the app will restart automatically.</p>
+            <p className="code-warning-note">{progress}%. The app will restart automatically.</p>
           </>
         )}
 

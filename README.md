@@ -9,7 +9,7 @@ This repository is the **desktop client**, built with [Tauri](https://tauri.app)
 ## Features
 
 - End-to-end encryption with the Signal Protocol, including double-ratchet forward secrecy and Kyber post-quantum prekeys
-- Sealed sender, so the relay never learns who sent a message
+- Sealed sender, so the relay can never tie a message to your identity
 - A separate mailbox per contact, so the relay cannot reconstruct your contact graph
 - Tor transport built in via [Arti](https://gitlab.torproject.org/tpo/core/arti); no separate Tor install needed on the client
 - Local message store and identity vault encrypted at rest (ChaCha20-Poly1305, Argon2id)

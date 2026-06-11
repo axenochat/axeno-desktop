@@ -445,7 +445,7 @@ export default function App() {
             <p className="code-warning-body">
               You have {codeWarning.codeIds.length} active connection code{codeWarning.codeIds.length > 1 ? "s" : ""} on
               the same relay as the blocked contact. They may still hold a code you
-              created — delete {codeWarning.codeIds.length > 1 ? "them" : "it"} to fully
+              created. Delete {codeWarning.codeIds.length > 1 ? "them" : "it"} to fully
               cut off access to your relay.
             </p>
             <p className="code-warning-note">
