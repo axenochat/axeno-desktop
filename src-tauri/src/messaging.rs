@@ -120,6 +120,12 @@ pub struct StoredContact {
     pub peer_sender_mailbox_id: Option<String>,
     #[serde(default)]
     pub acked_local_sender_mailbox_id: Option<String>,
+    /// Set when the user chooses "Delete conversation" (as opposed to "Delete &
+    /// block"). The contact's crypto state — identity, routes, and Signal session
+    /// — is preserved so messages can resume, but the thread is hidden from the
+    /// list and its history cleared. The next inbound text un-hides it.
+    #[serde(default)]
+    pub hidden: bool,
     pub created_at_ms: u64,
     pub last_read_at: Option<u64>,
 }
@@ -1747,6 +1753,7 @@ fn contact_from_payload(payload: InvitePayload, local_identity_public: &[u8]) ->
         local_route_id: None,
         peer_sender_mailbox_id: None,
         acked_local_sender_mailbox_id: None,
+        hidden: false,
         created_at_ms: now_ms(),
         last_read_at: None,
     })
@@ -2069,32 +2076,45 @@ pub async fn delete_contact(
         let contact_routes: Vec<LocalRoute> =
             store.local_routes.iter().filter(|r| belongs_to_contact(r)).cloned().collect();
 
+        // Always clear the local conversation history.
         store.messages.retain(|m| m.contact_id != contact_id);
-        // Drop every Signal session tied to this contact's identity so a later
-        // re-add starts from a clean prekey session instead of a stale ratchet.
-        if !contact.identity_public_b64.trim().is_empty() {
-            store.signal_sessions.retain(|_, s| s.remote_identity_b64 != contact.identity_public_b64);
-        }
-        // Remove the routes outright rather than marking them inactive: an
-        // inactive route would be auto-queued for relay retirement by
-        // cleanup_expired_routes, which must not happen on a conversation-only
-        // delete. For the relay variant we queue them explicitly below.
-        store.local_routes.retain(|r| !belongs_to_contact(r));
-        store.contacts.retain(|c| c.id != contact_id);
 
         if retire_relay {
+            // Full cut (used by "Delete & block"): forget the relationship
+            // entirely. Drop every Signal session tied to this contact's identity
+            // so a later re-add starts from a clean prekey session, remove the
+            // routes, drop the contact, and queue the mailboxes for retirement.
+            if !contact.identity_public_b64.trim().is_empty() {
+                store.signal_sessions.retain(|_, s| s.remote_identity_b64 != contact.identity_public_b64);
+            }
+            store.local_routes.retain(|r| !belongs_to_contact(r));
+            store.contacts.retain(|c| c.id != contact_id);
             for route in &contact_routes {
                 queue_relay_retire(&mut store, route.clone());
             }
+        } else {
+            // Plain "Delete conversation": keep the crypto relationship intact —
+            // the Signal session, the receive routes, and the contact's identity
+            // are all preserved so the peer can keep messaging us. We only clear
+            // the history (above) and hide the thread; the next inbound text
+            // un-hides it (see handle_incoming_envelope). Routes are left active
+            // so connect_all keeps the mailbox subscribed and we keep receiving.
+            if let Some(c) = store.contacts.iter_mut().find(|c| c.id == contact_id) {
+                c.hidden = true;
+                c.last_read_at = None;
+            }
         }
+
         save_store_with_key(&app, &store, &store_key)?;
         contact_routes
     };
 
-    // Tear down any live receive sockets for the removed routes regardless of the
-    // variant; nothing references them anymore.
-    for route in &contact_routes {
-        let _ = transport::disconnect_server(transport_state, route_connection_id(route)).await;
+    // Tear down live receive sockets only on the full-cut path; the plain delete
+    // keeps its routes so the contact can reach us again, so leave them connected.
+    if retire_relay {
+        for route in &contact_routes {
+            let _ = transport::disconnect_server(transport_state, route_connection_id(route)).await;
+        }
     }
 
     if retire_relay && !contact_routes.is_empty() {
@@ -2262,6 +2282,9 @@ pub async fn add_contact_from_code(
         existing.delivery_token_epoch = contact.delivery_token_epoch.max(existing.delivery_token_epoch);
         existing.safety_number = contact.safety_number.clone();
         existing.local_route_id = Some(route.id.clone());
+        // Re-adding a previously hidden ("Delete conversation") contact brings it
+        // back into the list.
+        existing.hidden = false;
         let updated = existing.clone();
         save_store_with_key(&app, &store, &store_key)?;
         return Ok(updated);
@@ -2309,7 +2332,11 @@ pub async fn snapshot(app: AppHandle, session: &AppSessionState, runtime: &Messa
     if first_run {
         save_store_with_key(&app, &store, &store_key)?;
     }
-    Ok(MessagingSnapshot { my_recipient_id, my_recipient_ids, contacts: store.contacts, messages: grouped })
+    // Hidden contacts (plain "Delete conversation") stay in the store so their
+    // Signal session and routes keep working, but they must not appear in the UI
+    // until the peer messages again and the inbound handler un-hides them.
+    let visible_contacts: Vec<StoredContact> = store.contacts.into_iter().filter(|c| !c.hidden).collect();
+    Ok(MessagingSnapshot { my_recipient_id, my_recipient_ids, contacts: visible_contacts, messages: grouped })
 }
 
 pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_state: &transport::TransportState, tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>) -> Result<(), String> {
@@ -2847,6 +2874,11 @@ pub async fn handle_incoming_envelope(
             status: "received".to_string(),
         };
         store.messages.push(msg.clone());
+        // If this conversation was hidden by a plain "Delete conversation",
+        // a real inbound text brings it back into the list.
+        if let Some(c) = store.contacts.iter_mut().find(|c| c.id == contact_id) {
+            c.hidden = false;
+        }
         send_delivery_ack_for_msg_id = Some(decrypted.message.message_id.clone());
         Some(msg)
     } else if decrypted.message.kind == "delivery_ack" {
@@ -3702,6 +3734,7 @@ mod signal_protocol_engine {
                 },
                 peer_sender_mailbox_id: Some(cert_sender_uuid.clone()),
                 acked_local_sender_mailbox_id: None,
+                hidden: false,
                 created_at_ms: now_ms(),
                 last_read_at: None,
             }
@@ -3948,6 +3981,7 @@ mod route_tests {
             local_route_id,
             peer_sender_mailbox_id: None,
             acked_local_sender_mailbox_id: None,
+            hidden: false,
             created_at_ms: now_ms(),
             last_read_at: None,
         }

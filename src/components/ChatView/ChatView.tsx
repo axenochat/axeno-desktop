@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Contact, Message } from "../../types";
 import { contactDisplayName, contactInitials, formatMessageTime } from "../../utils";
 import { IconDots, IconArrowUp } from "../icons";
@@ -26,6 +26,38 @@ function messageStatusLabel(status?: string): string {
 export default function ChatView({ contact, messages, onOpenChatSettings, onSendMessage, sendOnEnter, messageTextSize }: Props) {
   const [input, setInput] = useState("");
   const [sendError, setSendError] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Whether the view is pinned to the latest message. True while the user is at
+  // (or near) the bottom; set false once they scroll up to read history so an
+  // incoming message doesn't yank them back down.
+  const stickToBottomRef = useRef(true);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 80;
+  };
+
+  // Jump to the bottom whenever a different conversation is opened.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    stickToBottomRef.current = true;
+  }, [contact.id]);
+
+  // Keep the newest message visible as messages arrive. We always follow our own
+  // sent message; for incoming messages we only follow when the user is already
+  // at the bottom, so reading older history isn't interrupted.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const lastMine = messages[messages.length - 1]?.mine ?? false;
+    if (stickToBottomRef.current || lastMine) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages]);
 
   const send = () => {
     const text = input.trim();
@@ -51,7 +83,7 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
         </button>
       </header>
 
-      <div className="chat-messages">
+      <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
         <div className="date-divider">
           <span className="date-line"></span>
           <span className="date-label">Today</span>
