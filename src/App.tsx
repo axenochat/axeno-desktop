@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import Sidebar from "./components/Sidebar/Sidebar";
 import ChatView from "./components/ChatView/ChatView";
 import Settings from "./components/Settings/Settings";
@@ -12,6 +13,7 @@ import UpdatePrompt from "./components/UpdatePrompt/UpdatePrompt";
 import {
   Contact, Message, AppSettings, defaultSettings,
   MessagingSnapshot, BackendMessage, BackendContact, contactFromBackend, messageFromBackend,
+  FileProgress,
 } from "./types";
 import "./App.css";
 import "./components/Onboarding/Onboarding.css";
@@ -26,6 +28,7 @@ interface SendReceiptEvent { server_id: string; id: string; queued: boolean; cli
 interface SendFailedEvent { server_id: string; client_ref?: string | null; code: string; message: string; }
 interface ServerStatusEvent { server_id: string; status: string; reason?: string | null; }
 interface SyncStatusEvent { syncing: boolean; }
+interface FileProgressEvent { message_id: string; contact_id: string; direction: string; transferred_bytes: number; total_bytes: number; done: boolean; error?: string | null; }
 interface BackendPrivateServerSettings { private_servers: { id: string; name: string; onion: string }[]; default_server_url?: string | null; }
 
 function sanitizeSettingsForStorage(settings: AppSettings): AppSettings {
@@ -71,6 +74,8 @@ export default function App() {
 
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
+  // Live transfer progress keyed by message id, for the upload/download bars.
+  const [fileProgress, setFileProgress] = useState<Record<string, FileProgress>>({});
   const [activeContactId, setActiveContactId] = useState("");
   const activeContactIdRef = useRef("");
   const reconnectTimersRef = useRef<Record<string, number>>({});
@@ -258,6 +263,31 @@ export default function App() {
       } catch {}
     });
 
+    const unlistenFileProgress = listen<FileProgressEvent>("axeno-file-progress", (event) => {
+      const p = event.payload;
+      setFileProgress(prev => ({
+        ...prev,
+        [p.message_id]: {
+          direction: p.direction === "download" ? "download" : "upload",
+          transferred: p.transferred_bytes,
+          total: p.total_bytes,
+          done: p.done,
+          error: p.error ?? null,
+        },
+      }));
+      // Drop a finished/failed entry shortly after so the map doesn't grow; the
+      // bubble reflects the final state from the stored message by then.
+      if (p.done || p.error) {
+        window.setTimeout(() => {
+          setFileProgress(prev => {
+            const next = { ...prev };
+            delete next[p.message_id];
+            return next;
+          });
+        }, 1500);
+      }
+    });
+
     const unlistenMessage = listen<IncomingMessageEvent>("axeno-message", (event) => {
       const contactId = event.payload.contact_id;
       const msg = messageFromBackend(event.payload.message);
@@ -298,6 +328,7 @@ export default function App() {
       unlistenServerStatus.then(f => f());
       unlistenSendReceipt.then(f => f());
       unlistenSendFailed.then(f => f());
+      unlistenFileProgress.then(f => f());
       unlistenMessage.then(f => f());
       Object.values(reconnectTimersRef.current).forEach(timer => window.clearTimeout(timer));
       reconnectTimersRef.current = {};
@@ -368,6 +399,57 @@ export default function App() {
       });
       throw e;
     }
+  };
+
+  const sendFile = async (contactId: string) => {
+    const selected = await openFileDialog({ multiple: false, title: "Send a file" });
+    if (!selected || typeof selected !== "string") return;
+    const filePath = selected;
+    const fileName = filePath.split(/[\\/]/).pop() || "file";
+    // Pre-generate the id so the optimistic bubble and the backend's upload
+    // progress events line up on the same message.
+    const messageId = (crypto as Crypto).randomUUID();
+    const optimisticMsg: Message = {
+      id: messageId,
+      text: "",
+      mine: true,
+      timestamp: Date.now(),
+      status: "relay_pending",
+      attachment: {
+        transferId: "", fileName, mime: "", size: 0, totalChunks: 0,
+        serverUrl: "", localPath: filePath, downloadState: "uploading",
+      },
+    };
+    setMessages(prev => ({ ...prev, [contactId]: [...(prev[contactId] ?? []), optimisticMsg] }));
+    try {
+      const res = await invoke<SendMessageResponse>("messaging_send_file_message", { contactId, filePath, messageId });
+      const msg = messageFromBackend(res.message);
+      setMessages(prev => {
+        const existing = prev[contactId] ?? [];
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId ? msg : m) };
+      });
+    } catch (e) {
+      setMessages(prev => {
+        const existing = prev[contactId] ?? [];
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId
+          ? { ...m, status: "send_failed", attachment: m.attachment ? { ...m.attachment, downloadState: "failed" } : m.attachment }
+          : m) };
+      });
+      throw e;
+    }
+  };
+
+  const downloadFile = async (msg: Message) => {
+    if (!msg.attachment) return;
+    const savePath = await saveFileDialog({ defaultPath: msg.attachment.fileName, title: "Save file" });
+    if (!savePath || typeof savePath !== "string") return;
+    const updated = await invoke<BackendMessage>("messaging_download_file", { messageId: msg.id, savePath });
+    const next = messageFromBackend(updated);
+    const contactId = updated.contact_id;
+    setMessages(prev => {
+      const existing = prev[contactId] ?? [];
+      return { ...prev, [contactId]: existing.map(m => m.id === next.id ? next : m) };
+    });
   };
 
   const migrateContactRelay = async (contactId: string, code: string) => {
@@ -458,7 +540,7 @@ export default function App() {
       <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} />
 
       {active ? (
-        <ChatView contact={active} messages={messages[active.id] || []} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />
+        <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />
       ) : (
         <main className="chat-view empty-chat">Generate a connection code or add a contact to start messaging.</main>
       )}

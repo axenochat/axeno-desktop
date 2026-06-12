@@ -68,6 +68,26 @@ export function isSameMinute(a: number, b: number): boolean {
   return Math.floor(a / 60_000) === Math.floor(b / 60_000);
 }
 
+/** Human-readable byte size, e.g. 1536 -> "1.5 KB", 0 -> "0 B". */
+export function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const rounded = unit === 0 ? value : Math.round(value * 10) / 10;
+  return `${rounded} ${units[unit]}`;
+}
+
+/** One-line preview text for a message in the conversation list. */
+export function messagePreview(message: Message): string {
+  if (message.attachment) return `📎 ${message.attachment.fileName}`;
+  return message.text;
+}
+
 export function lastMessage(messages: Message[]): Message | undefined {
   if (!messages.length) return undefined;
   return messages.reduce((a, b) => (a.timestamp > b.timestamp ? a : b));

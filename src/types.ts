@@ -21,6 +21,30 @@ export interface Contact {
 }
 
 
+/** A file rendered on a message bubble. Mirrors the backend FileAttachment,
+ * minus the decryption key (which the UI never needs). `downloadState` is
+ * "downloaded" for files we sent, and "available"/"downloading"/"downloaded"/
+ * "failed" for files we received. */
+export interface Attachment {
+  transferId: string;
+  fileName: string;
+  mime: string;
+  size: number;
+  totalChunks: number;
+  serverUrl: string;
+  localPath?: string | null;
+  downloadState?: string | null;
+}
+
+/** Live progress for an in-flight file transfer, keyed by message id in the UI. */
+export interface FileProgress {
+  direction: "upload" | "download";
+  transferred: number;
+  total: number;
+  done: boolean;
+  error?: string | null;
+}
+
 export interface Message {
   id: string;
   mine: boolean;
@@ -31,6 +55,7 @@ export interface Message {
    */
   receivedAtMs?: number | null;
   status?: string;
+  attachment?: Attachment | null;
 }
 
 export interface PrivateServer {
@@ -96,6 +121,19 @@ export interface BackendContact {
   last_read_at?: number | null;
 }
 
+export interface BackendAttachment {
+  transfer_id: string;
+  key_b64: string;
+  file_name: string;
+  mime: string;
+  size: number;
+  chunk_size: number;
+  total_chunks: number;
+  server_url: string;
+  local_path?: string | null;
+  download_state?: string | null;
+}
+
 export interface BackendMessage {
   id: string;
   contact_id: string;
@@ -104,6 +142,7 @@ export interface BackendMessage {
   timestamp: number;
   received_at_ms?: number | null;
   status: string;
+  attachment?: BackendAttachment | null;
 }
 
 export interface MessagingSnapshot {
@@ -134,5 +173,19 @@ export function messageFromBackend(m: BackendMessage): Message {
     timestamp: m.timestamp,
     receivedAtMs: m.received_at_ms ?? null,
     status: m.status,
+    attachment: m.attachment ? attachmentFromBackend(m.attachment) : null,
+  };
+}
+
+export function attachmentFromBackend(a: BackendAttachment): Attachment {
+  return {
+    transferId: a.transfer_id,
+    fileName: a.file_name,
+    mime: a.mime,
+    size: a.size,
+    totalChunks: a.total_chunks,
+    serverUrl: a.server_url,
+    localPath: a.local_path ?? null,
+    downloadState: a.download_state ?? null,
   };
 }

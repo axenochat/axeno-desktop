@@ -140,6 +140,74 @@ pub struct StoredMessage {
     #[serde(default)]
     pub received_at_ms: Option<u64>,
     pub status: String,
+    /// Present when this message carries a file. For a sent message it records
+    /// what we uploaded (and where the local source lives); for a received one it
+    /// is the capability the user needs to download. `None` for plain text.
+    #[serde(default)]
+    pub attachment: Option<FileAttachment>,
+}
+
+/// File-transfer metadata attached to a [`StoredMessage`]. The `key_b64` here is
+/// the symmetric key that decrypts the blob's chunks; it only ever lives inside
+/// the encrypted local store and the E2E-encrypted pointer, never on the relay.
+/// The relay sees only opaque chunks under the random `transfer_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttachment {
+    pub transfer_id: String,
+    pub key_b64: String,
+    pub file_name: String,
+    pub mime: String,
+    /// Plaintext byte length of the file.
+    pub size: u64,
+    /// Plaintext bytes per chunk (the final chunk may be smaller).
+    pub chunk_size: u32,
+    pub total_chunks: u32,
+    /// The relay (ws:// onion URL) that holds the blob: the sender's relay.
+    pub server_url: String,
+    /// Where the file lives on this device: the source path on the sender, or the
+    /// saved copy on the receiver once downloaded. `None` until downloaded.
+    #[serde(default)]
+    pub local_path: Option<String>,
+    /// Download lifecycle for a received file: absent/`"available"` (not fetched
+    /// yet), `"downloading"`, `"downloaded"`, or `"failed"`. Always `"downloaded"`
+    /// for a file we sent (we already hold the source).
+    #[serde(default)]
+    pub download_state: Option<String>,
+}
+
+/// Plaintext bytes per file chunk before encryption. Each stored chunk is this
+/// plus the 16-byte AEAD tag, then base64'd for the wire; that stays under the
+/// relay's 512 KiB frame limit with comfortable headroom.
+const FILE_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
+/// AEAD tag length added to every encrypted chunk (ChaCha20-Poly1305).
+const FILE_CHUNK_TAG_BYTES: u64 = 16;
+
+/// The wire pointer for a "file" payload: everything the recipient needs to
+/// fetch and decrypt the blob, carried inside the E2E-encrypted Signal body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FilePointer {
+    v: u16,
+    transfer_id: String,
+    key_b64: String,
+    file_name: String,
+    mime: String,
+    size: u64,
+    chunk_size: u32,
+    total_chunks: u32,
+    server_url: String,
+}
+
+/// Source for an outgoing file send, prepared by `send_file_message` and consumed
+/// inside `send_signal_payload_internal` once the upload target is known.
+struct FileSendSource {
+    path: std::path::PathBuf,
+    file_name: String,
+    mime: String,
+    size: u64,
+    key_b64: String,
+    transfer_id: String,
+    chunk_size: u32,
+    total_chunks: u32,
 }
 
 fn default_store_version() -> u16 { 1 }
@@ -556,7 +624,7 @@ fn encode_signal_plaintext(
 
 fn decode_signal_plaintext(raw: Vec<u8>) -> Result<DecryptedSignalText, String> {
     if let Ok(payload) = serde_json::from_slice::<AxenoSignalPlaintext>(&raw) {
-        if payload.v != 1 || !matches!(payload.kind.as_str(), "text" | "route_sync" | "route_sync_ack" | "delivery_ack") {
+        if payload.v != 1 || !matches!(payload.kind.as_str(), "text" | "file" | "route_sync" | "route_sync_ack" | "delivery_ack") {
             return Err("unsupported encrypted Axeno message payload".into());
         }
         return Ok(DecryptedSignalText {
@@ -2451,11 +2519,16 @@ async fn send_signal_payload_internal(
     text: String,
     visible: bool,
     force_prekey: bool,
+    file_source: Option<FileSendSource>,
+    forced_message_id: Option<String>,
 ) -> Result<Option<StoredMessage>, String> {
     let (store_key, legacy_store_key) = store_keys(session).await?;
-    let trimmed = if payload_kind == "text" { text.trim().to_string() } else { text };
+    // For a file send the wire body is the pointer JSON, built only after the
+    // blob is uploaded (below); `text` is unused. For everything else the body is
+    // the caller's text, trimmed for real messages.
+    let mut trimmed = if payload_kind == "text" { text.trim().to_string() } else { text };
     if payload_kind == "text" && trimmed.is_empty() { return Err("message is empty".into()); }
-    if trimmed.len() > 16 * 1024 { return Err("message too large for text MVP".into()); }
+    if payload_kind != "file" && trimmed.len() > 16 * 1024 { return Err("message too large for text MVP".into()); }
     let blob = load_vault(&app)?;
     let material = signal_material(session).await?;
 
@@ -2519,8 +2592,57 @@ async fn send_signal_payload_internal(
         }
     };
 
-    let message_id = Uuid::new_v4().to_string();
+    // A file send pre-generates its id in the UI so the optimistic bubble and the
+    // upload-progress events share one id; everything else mints a fresh id here.
+    let message_id = forced_message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let sent_at = now_ms();
+
+    // For a file send, upload the encrypted blob now — to the sender's own relay
+    // (`sender_route_for_cert`, the warm connection that just issued the cert) —
+    // before composing the pointer we hand the peer. Uploading first means the
+    // peer never receives a pointer to a transfer that does not yet exist. The
+    // pointer JSON becomes the wire body, and `file_attachment` rides the local
+    // stored message so the bubble can render it.
+    let mut file_attachment: Option<FileAttachment> = None;
+    if let Some(src) = file_source {
+        // Reject up front if this relay's advertised cap cannot hold the blob.
+        // The relay enforces it too, but failing here avoids a wasted upload.
+        let declared_total = src.size + src.total_chunks as u64 * FILE_CHUNK_TAG_BYTES;
+        if let Some(limit) = transport::server_file_limit(transport_state, &connection_id_for_cert).await {
+            if declared_total > limit {
+                return Err(format!(
+                    "file is too large for this relay (limit {} MiB)",
+                    limit / (1024 * 1024)
+                ));
+            }
+        }
+        upload_file_blob(&app, transport_state, &connection_id_for_cert, &contact_id, &message_id, &src, declared_total).await?;
+        let pointer = FilePointer {
+            v: 1,
+            transfer_id: src.transfer_id.clone(),
+            key_b64: src.key_b64.clone(),
+            file_name: src.file_name.clone(),
+            mime: src.mime.clone(),
+            size: src.size,
+            chunk_size: src.chunk_size,
+            total_chunks: src.total_chunks,
+            server_url: sender_route_for_cert.server_url.clone(),
+        };
+        trimmed = serde_json::to_string(&pointer).map_err(|e| format!("could not serialize file pointer: {e}"))?;
+        file_attachment = Some(FileAttachment {
+            transfer_id: src.transfer_id,
+            key_b64: src.key_b64,
+            file_name: src.file_name,
+            mime: src.mime,
+            size: src.size,
+            chunk_size: src.chunk_size,
+            total_chunks: src.total_chunks,
+            server_url: sender_route_for_cert.server_url.clone(),
+            local_path: Some(src.path.to_string_lossy().to_string()),
+            download_state: Some("downloaded".to_string()),
+        });
+    }
+
     let (send_server_url, send_to, send_delivery_token, wire_json, mut maybe_msg) = {
         let _store_guard = session.messaging_store_lock.lock().await;
         let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
@@ -2557,10 +2679,13 @@ async fn send_signal_payload_internal(
                 id: message_id.clone(),
                 contact_id: contact.id.clone(),
                 mine: true,
-                text: trimmed.clone(),
+                // A file bubble renders from its attachment, not body text (which
+                // is the opaque pointer JSON), so keep the visible text empty.
+                text: if payload_kind == "file" { String::new() } else { trimmed.clone() },
                 timestamp: sent_at,
                 received_at_ms: None,
                 status: "relay_pending".to_string(),
+                attachment: file_attachment.clone(),
             };
             store.messages.push(msg.clone());
             Some(msg)
@@ -2671,7 +2796,7 @@ async fn send_route_control(
     contact_id: String,
     kind: &str,
 ) -> Result<(), String> {
-    let _ = send_signal_payload_internal(app, session, transport_state, tor_client, contact_id, kind, String::new(), false, true).await?;
+    let _ = send_signal_payload_internal(app, session, transport_state, tor_client, contact_id, kind, String::new(), false, true, None, None).await?;
     Ok(())
 }
 
@@ -2693,9 +2818,318 @@ pub async fn send_text_message(
         text,
         true,
         false,
+        None,
+        None,
     ).await?
     .ok_or_else(|| "message send did not produce a local message".to_string())?;
     Ok(SendMessageResponse { message })
+}
+
+/// Progress for an in-flight file transfer, emitted as `axeno-file-progress`.
+/// `transferred_bytes`/`total_bytes` are plaintext sizes so the UI can show a
+/// percentage against the file the user actually sees.
+#[derive(Clone, Serialize)]
+pub struct FileProgressEvent {
+    pub message_id: String,
+    pub contact_id: String,
+    /// `"upload"` or `"download"`.
+    pub direction: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn emit_file_progress(app: &AppHandle, message_id: &str, contact_id: &str, direction: &str, transferred: u64, total: u64, done: bool, error: Option<String>) {
+    let _ = app.emit("axeno-file-progress", FileProgressEvent {
+        message_id: message_id.to_string(),
+        contact_id: contact_id.to_string(),
+        direction: direction.to_string(),
+        transferred_bytes: transferred,
+        total_bytes: total,
+        done,
+        error,
+    });
+}
+
+/// Build the per-file ChaCha20-Poly1305 cipher from a transfer's base64 key.
+fn file_cipher(key_b64: &str) -> Result<ChaCha20Poly1305, String> {
+    let key = STANDARD_NO_PAD.decode(key_b64.as_bytes()).map_err(|_| "bad file key encoding".to_string())?;
+    if key.len() != 32 { return Err("file key must be 32 bytes".into()); }
+    Ok(ChaCha20Poly1305::new(Key::from_slice(&key)))
+}
+
+/// Deterministic 96-bit nonce for chunk `index`. The file key is random and used
+/// for exactly one transfer, so a per-index nonce never repeats a (key, nonce)
+/// pair. Layout: four zero bytes followed by the little-endian chunk index.
+fn file_chunk_nonce(index: u32) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..12].copy_from_slice(&(index as u64).to_le_bytes());
+    nonce
+}
+
+/// Strip any directory components and control characters from a peer-supplied (or
+/// local) file name so it can never escape a chosen download directory or smuggle
+/// path separators. Falls back to a generic name if nothing usable remains.
+fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(200)
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim();
+    if cleaned.is_empty() { "file".to_string() } else { cleaned.to_string() }
+}
+
+/// Best-effort MIME type from a file name's extension. The relay never sees this;
+/// it is a hint so the receiver's UI can preview/label the attachment. Unknown
+/// extensions fall back to a generic binary type.
+fn guess_mime(name: &str) -> String {
+    let ext = name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "heic" => "image/heic",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "opus" => "audio/ogg",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "doc" | "docx" => "application/msword",
+        "xls" | "xlsx" => "application/vnd.ms-excel",
+        _ => "application/octet-stream",
+    };
+    mime.to_string()
+}
+
+/// Encrypt and upload every chunk of `src` to the sender's relay over the warm
+/// `connection_id`, emitting upload progress per chunk. Reads the file a chunk at
+/// a time so memory stays bounded regardless of the operator's size cap.
+async fn upload_file_blob(
+    app: &AppHandle,
+    transport_state: &transport::TransportState,
+    connection_id: &str,
+    contact_id: &str,
+    message_id: &str,
+    src: &FileSendSource,
+    declared_total: u64,
+) -> Result<(), String> {
+    use std::io::Read;
+    let cipher = file_cipher(&src.key_b64)?;
+    let mut file = std::fs::File::open(&src.path).map_err(|e| format!("could not open file: {e}"))?;
+    let mut buf = vec![0u8; src.chunk_size as usize];
+    let mut transferred: u64 = 0;
+    for chunk_index in 0..src.total_chunks {
+        let want = std::cmp::min(src.chunk_size as u64, src.size - transferred) as usize;
+        let mut filled = 0;
+        while filled < want {
+            let n = file.read(&mut buf[filled..want]).map_err(|e| format!("could not read file: {e}"))?;
+            if n == 0 { return Err("file ended early; it may have changed on disk during send".into()); }
+            filled += n;
+        }
+        let nonce = file_chunk_nonce(chunk_index);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), &buf[..want])
+            .map_err(|_| "file chunk encryption failed".to_string())?;
+        let ciphertext_b64 = STANDARD_NO_PAD.encode(&ciphertext);
+        if let Err(e) = transport::upload_file_chunk(
+            transport_state,
+            connection_id,
+            src.transfer_id.clone(),
+            chunk_index,
+            src.total_chunks,
+            declared_total,
+            ciphertext_b64,
+        ).await {
+            emit_file_progress(app, message_id, contact_id, "upload", transferred, src.size, false, Some(e.clone()));
+            return Err(format!("file upload failed on chunk {chunk_index}: {e}"));
+        }
+        transferred += want as u64;
+        emit_file_progress(app, message_id, contact_id, "upload", transferred, src.size, transferred >= src.size, None);
+    }
+    Ok(())
+}
+
+/// Prepare a local file for sending: chunk math, a fresh random key and transfer
+/// id, then hand off to the unified send path which uploads the blob and delivers
+/// the E2E pointer. Returns the local (sender-side) stored message.
+pub async fn send_file_message(
+    app: AppHandle,
+    session: &AppSessionState,
+    transport_state: &transport::TransportState,
+    tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
+    contact_id: String,
+    file_path: String,
+    message_id: String,
+) -> Result<SendMessageResponse, String> {
+    let path = std::path::PathBuf::from(&file_path);
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot read file: {e}"))?;
+    if !meta.is_file() { return Err("the selected path is not a file".into()); }
+    let size = meta.len();
+    if size == 0 { return Err("cannot send an empty file".into()); }
+    let file_name = sanitize_file_name(
+        &path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+    );
+    let mime = guess_mime(&file_name);
+    let chunk_size = FILE_CHUNK_PLAINTEXT_BYTES as u32;
+    let total_chunks = u32::try_from(size.div_ceil(FILE_CHUNK_PLAINTEXT_BYTES as u64))
+        .map_err(|_| "file is too large to chunk".to_string())?;
+    let mut key = [0u8; 32];
+    fill_random(&mut key)?;
+    let key_b64 = STANDARD_NO_PAD.encode(key);
+    let transfer_id = random_token("xfer_", 24)?;
+    let src = FileSendSource { path, file_name, mime, size, key_b64, transfer_id, chunk_size, total_chunks };
+    let message = send_signal_payload_internal(
+        app, session, transport_state, tor_client, contact_id, "file", String::new(), true, false, Some(src), Some(message_id),
+    ).await?
+    .ok_or_else(|| "file send did not produce a local message".to_string())?;
+    Ok(SendMessageResponse { message })
+}
+
+/// Update a stored message's attachment download lifecycle (and optionally its
+/// on-disk path), returning the refreshed message. A missing message or
+/// attachment is a no-op returning `None`.
+async fn update_attachment_state(
+    app: &AppHandle,
+    session: &AppSessionState,
+    store_key: &[u8; 32],
+    legacy_store_key: &[u8; 32],
+    message_id: &str,
+    download_state: &str,
+    local_path: Option<String>,
+) -> Result<Option<StoredMessage>, String> {
+    let _store_guard = session.messaging_store_lock.lock().await;
+    let mut store = load_store_with_keys(app, store_key, legacy_store_key)?;
+    let Some(msg) = store.messages.iter_mut().find(|m| m.id == message_id) else { return Ok(None); };
+    if let Some(att) = msg.attachment.as_mut() {
+        att.download_state = Some(download_state.to_string());
+        if local_path.is_some() { att.local_path = local_path; }
+    }
+    let out = msg.clone();
+    save_store_with_key(app, &store, store_key)?;
+    Ok(Some(out))
+}
+
+/// Download, decrypt, and reassemble a received file to `save_path`. Streams over
+/// a single warm Tor circuit (see `transport::download_transfer`), writing to a
+/// `.part` file first and renaming on success so a partial download never looks
+/// complete. Reports progress and the final state on the stored message.
+pub async fn download_file(
+    app: AppHandle,
+    session: &AppSessionState,
+    tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
+    message_id: String,
+    save_path: String,
+) -> Result<StoredMessage, String> {
+    use std::io::Write;
+    let (store_key, legacy_store_key) = store_keys(session).await?;
+    let (attachment, contact_id) = {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        let msg = store.messages.iter().find(|m| m.id == message_id).ok_or_else(|| "message not found".to_string())?;
+        let att = msg.attachment.clone().ok_or_else(|| "message has no attachment".to_string())?;
+        (att, msg.contact_id.clone())
+    };
+
+    let cipher = file_cipher(&attachment.key_b64)?;
+    let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "downloading", None).await?;
+
+    // Helper closure semantics handled inline: on any failure mark the message
+    // failed, clean up the partial file, and return the error.
+    let part_path = format!("{save_path}.part");
+    let fail = |app: &AppHandle, message_id: &str, contact_id: &str, total: u64, part: &str, err: String| {
+        let _ = std::fs::remove_file(part);
+        emit_file_progress(app, message_id, contact_id, "download", 0, total, false, Some(err.clone()));
+        err
+    };
+
+    let mut rx = match transport::download_transfer(
+        tor_client.clone(), attachment.server_url.clone(), attachment.transfer_id.clone(), attachment.total_chunks,
+    ).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not start download: {e}")));
+        }
+    };
+
+    let mut file = match std::fs::File::create(&part_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not create download file: {e}")));
+        }
+    };
+
+    let mut next_index = 0u32;
+    let mut written: u64 = 0;
+    while let Some(item) = rx.recv().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+                return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("download failed: {e}")));
+            }
+        };
+        if chunk.chunk_index != next_index {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "relay returned file chunks out of order".to_string()));
+        }
+        let raw = match STANDARD_NO_PAD.decode(chunk.ciphertext_b64.as_bytes()) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+                return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file chunk was not valid base64".to_string()));
+            }
+        };
+        let nonce = file_chunk_nonce(chunk.chunk_index);
+        let plain = match cipher.decrypt(Nonce::from_slice(&nonce), raw.as_ref()) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+                return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file chunk failed to decrypt (wrong key or corrupted)".to_string()));
+            }
+        };
+        if let Err(e) = file.write_all(&plain) {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not write download: {e}")));
+        }
+        written += plain.len() as u64;
+        next_index += 1;
+        emit_file_progress(&app, &message_id, &contact_id, "download", written, attachment.size, false, None);
+    }
+
+    if next_index != attachment.total_chunks || written != attachment.size {
+        let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+        return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "download ended before the whole file arrived".to_string()));
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+        return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not flush download: {e}")));
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&part_path, &save_path) {
+        let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+        return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not finalize download: {e}")));
+    }
+
+    let updated = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "downloaded", Some(save_path)).await?
+        .ok_or_else(|| "message vanished during download".to_string())?;
+    emit_file_progress(&app, &message_id, &contact_id, "download", attachment.size, attachment.size, true, None);
+    Ok(updated)
 }
 
 pub async fn handle_incoming_envelope(
@@ -2872,6 +3306,7 @@ pub async fn handle_incoming_envelope(
             timestamp: decrypted.message.sent_at_ms,
             received_at_ms: Some(received_at),
             status: "received".to_string(),
+            attachment: None,
         };
         store.messages.push(msg.clone());
         // If this conversation was hidden by a plain "Delete conversation",
@@ -2881,6 +3316,43 @@ pub async fn handle_incoming_envelope(
         }
         send_delivery_ack_for_msg_id = Some(decrypted.message.message_id.clone());
         Some(msg)
+    } else if decrypted.message.kind == "file" {
+        // A file pointer: store the capability so the user can download on demand
+        // (we deliberately do not auto-fetch the blob — the recipient decides when
+        // to spend the bandwidth). The bubble renders from the attachment.
+        match serde_json::from_str::<FilePointer>(&decrypted.message.body) {
+            Ok(p) if p.v == 1 && p.total_chunks > 0 => {
+                let attachment = FileAttachment {
+                    transfer_id: p.transfer_id,
+                    key_b64: p.key_b64,
+                    file_name: sanitize_file_name(&p.file_name),
+                    mime: p.mime,
+                    size: p.size,
+                    chunk_size: p.chunk_size,
+                    total_chunks: p.total_chunks,
+                    server_url: p.server_url,
+                    local_path: None,
+                    download_state: Some("available".to_string()),
+                };
+                let msg = StoredMessage {
+                    id: decrypted.message.message_id.clone(),
+                    contact_id: contact_id.clone(),
+                    mine: false,
+                    text: String::new(),
+                    timestamp: decrypted.message.sent_at_ms,
+                    received_at_ms: Some(received_at),
+                    status: "received".to_string(),
+                    attachment: Some(attachment),
+                };
+                store.messages.push(msg.clone());
+                if let Some(c) = store.contacts.iter_mut().find(|c| c.id == contact_id) {
+                    c.hidden = false;
+                }
+                send_delivery_ack_for_msg_id = Some(decrypted.message.message_id.clone());
+                Some(msg)
+            }
+            _ => None, // malformed pointer: ack-and-drop rather than crash the loop
+        }
     } else if decrypted.message.kind == "delivery_ack" {
         // Body holds the original outgoing message ID. Upgrade it from
         // relay_queued → relay_received to show the peer actually got it.
@@ -3023,7 +3495,7 @@ pub async fn handle_incoming_envelope(
         if !doing_route_sync {
             let _ = send_signal_payload_internal(
                 app.clone(), session, transport_state, tor_client.clone(),
-                contact_id, "delivery_ack", original_msg_id, false, false,
+                contact_id, "delivery_ack", original_msg_id, false, false, None, None,
             ).await;
         }
     }

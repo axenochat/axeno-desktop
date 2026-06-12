@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 const PROTOCOL_MIN_SUPPORTED: u16 = 4;
 // v6 adds the `synced` server frame (terminal end-of-backlog marker).
-const PROTOCOL_VERSION: u16 = 6;
+// v7 adds chunked file transfer (upload/fetch/delete frames) and the
+// `max_file_bytes` field on `hello_ok`.
+const PROTOCOL_VERSION: u16 = 7;
 /// If a relay never sends `Synced` (it predates protocol v6), clear this
 /// connection's syncing flag this long after HelloOk so the indicator can't
 /// stick on. A v6 relay sends `Synced` right after the flush, well within this.
@@ -39,6 +41,12 @@ pub struct TransportState {
     sender_cert_cache: Arc<Mutex<HashMap<String, SenderCertificateResponse>>>,
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
+    /// In-flight file-transfer requests (upload/fetch/delete), keyed by their
+    /// per-request id. The receive loop resolves each with the relay's reply.
+    pending_files: Arc<Mutex<HashMap<String, oneshot::Sender<FileOpReply>>>>,
+    /// Per-server operator-advertised per-file byte cap, captured from HelloOk so
+    /// the client can pre-check a file size and surface the limit in the UI.
+    server_file_limits: Arc<Mutex<HashMap<String, u64>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
     /// Connection ids whose offline backlog is still being delivered (from the
     /// start of the connection attempt until the relay's `Synced` marker, a
@@ -108,19 +116,37 @@ enum ClientFrame {
     },
     UploadBundle { request_id: String, bundle_id: String, ciphertext: String, expires_at_ms: u64, pow: Option<String> },
     FetchBundle { request_id: String, bundle_id: String },
+    UploadFileChunk { request_id: String, transfer_id: String, chunk_index: u32, total_chunks: u32, total_bytes: u64, ciphertext: String, pow: Option<String> },
+    FetchFileChunk { request_id: String, transfer_id: String, chunk_index: u32 },
+    DeleteTransfer { request_id: String, transfer_id: String },
     Ack { ids: Vec<Uuid> },
     RetireMailbox,
     Ping,
+}
+
+/// The relay's reply to one in-flight file-transfer request, routed back to the
+/// waiting `upload_file_chunk` / `fetch_file_chunk` / `delete_transfer` call by
+/// request id.
+#[derive(Debug)]
+enum FileOpReply {
+    ChunkStored { received_chunks: u32, total_chunks: u32 },
+    Chunk { total_chunks: u32, total_bytes: u64, ciphertext: String },
+    Deleted,
+    Error { code: String, message: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 enum ServerFrame {
-    HelloOk { protocol_version: u16, server_time_ms: u64, trust_root_b64: String, #[serde(default)] min_supported: Option<u16>, #[serde(default)] current_protocol: Option<u16> },
+    HelloOk { protocol_version: u16, server_time_ms: u64, trust_root_b64: String, #[serde(default)] min_supported: Option<u16>, #[serde(default)] current_protocol: Option<u16>, #[serde(default)] max_file_bytes: Option<u64> },
     SenderCertificate { request_id: String, certificate_b64: String, trust_root_b64: String, expires_at_ms: u64 },
     BundleUploaded { request_id: String, bundle_id: String, expires_at_ms: u64 },
     Bundle { request_id: String, bundle_id: String, ciphertext: String, expires_at_ms: u64 },
+    FileChunkStored { request_id: String, transfer_id: String, chunk_index: u32, received_chunks: u32, total_chunks: u32 },
+    FileChunk { request_id: String, transfer_id: String, chunk_index: u32, total_chunks: u32, total_bytes: u64, ciphertext: String },
+    TransferDeleted { request_id: String, transfer_id: String },
+    FileError { request_id: String, transfer_id: String, code: String, message: String },
     Envelope { envelope: StoredEnvelope },
     /// Terminal end-of-backlog marker (relay protocol v6+). See `ServerFrame` in
     /// the relay's protocol.rs.
@@ -220,6 +246,8 @@ pub async fn connect_server(
     let pending_certs = state.pending_sender_certs.clone();
     let pending_token_updates = state.pending_token_updates.clone();
     let pending_sends = state.pending_sends.clone();
+    let pending_files = state.pending_files.clone();
+    let server_file_limits = state.server_file_limits.clone();
     let trust_roots = state.server_trust_roots.clone();
     let connections = state.connections.clone();
     let syncing_conns = state.syncing_conns.clone();
@@ -231,7 +259,7 @@ pub async fn connect_server(
         // the Tor connect + handshake, so marking here — not at HelloOk — keeps
         // the indicator on through the slow part too.
         set_conn_syncing(&app_for_task, &syncing_conns, &task_server_id, true).await;
-        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, Some(ready_tx)).await;
+        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, Some(ready_tx)).await;
         remove_connection_if_same(&connections, &task_server_id, instance_id).await;
         // Cleanup: if the connection ended before `Synced` (e.g. it failed during
         // connect), clear its syncing flag so the indicator can't stick.
@@ -772,6 +800,213 @@ pub async fn fetch_invite_bundle(
     }
 }
 
+/// The operator-advertised per-file byte cap for a connected server, captured
+/// from its HelloOk. `None` if the server is not connected or advertised no cap
+/// (a pre-v7 relay).
+pub async fn server_file_limit(state: &TransportState, server_id: &str) -> Option<u64> {
+    state.server_file_limits.lock().await.get(server_id).copied()
+}
+
+/// Upload one already-encrypted chunk of a file transfer over the server's live
+/// connection, awaiting the relay's ack. `chunk_index == 0` creates the transfer
+/// and is proof-of-work gated (computed here); later chunks ride the existing
+/// transfer. Returns `(received_chunks, total_chunks)` so the caller can report
+/// progress and detect completion.
+pub async fn upload_file_chunk(
+    state: &TransportState,
+    server_id: &str,
+    transfer_id: String,
+    chunk_index: u32,
+    total_chunks: u32,
+    total_bytes: u64,
+    ciphertext_b64: String,
+) -> Result<(u32, u32), String> {
+    validate_bundle_id(&transfer_id)?;
+    if ciphertext_b64.len() > 512 * 1024 { return Err("file chunk exceeds 512 KiB frame limit".into()); }
+    // The first chunk creates the transfer and must carry proof-of-work, computed
+    // here (off the caller) to match the relay's gate. Later chunks need none.
+    let pow = if chunk_index == 0 { Some(generate_pow(&transfer_id).await) } else { None };
+    let reply = file_request(state, server_id, |request_id| ClientFrame::UploadFileChunk {
+        request_id,
+        transfer_id,
+        chunk_index,
+        total_chunks,
+        total_bytes,
+        ciphertext: ciphertext_b64,
+        pow,
+    }).await?;
+    match reply {
+        FileOpReply::ChunkStored { received_chunks, total_chunks } => Ok((received_chunks, total_chunks)),
+        FileOpReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("unexpected relay reply to file chunk upload".into()),
+    }
+}
+
+/// Fetch one chunk of a transfer over the server's live connection. Returns the
+/// chunk ciphertext (base64) and the transfer's declared shape.
+pub async fn fetch_file_chunk(
+    state: &TransportState,
+    server_id: &str,
+    transfer_id: String,
+    chunk_index: u32,
+) -> Result<(String, u32, u64), String> {
+    validate_bundle_id(&transfer_id)?;
+    let reply = file_request(state, server_id, |request_id| ClientFrame::FetchFileChunk { request_id, transfer_id, chunk_index }).await?;
+    match reply {
+        FileOpReply::Chunk { total_chunks, total_bytes, ciphertext } => Ok((ciphertext, total_chunks, total_bytes)),
+        FileOpReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("unexpected relay reply to file chunk fetch".into()),
+    }
+}
+
+/// Delete a whole transfer over the server's live connection (idempotent).
+pub async fn delete_transfer(
+    state: &TransportState,
+    server_id: &str,
+    transfer_id: String,
+) -> Result<(), String> {
+    validate_bundle_id(&transfer_id)?;
+    let reply = file_request(state, server_id, |request_id| ClientFrame::DeleteTransfer { request_id, transfer_id }).await?;
+    match reply {
+        FileOpReply::Deleted => Ok(()),
+        FileOpReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("unexpected relay reply to transfer delete".into()),
+    }
+}
+
+/// Send one file-transfer frame on a server's existing connection and await its
+/// reply, correlated by a freshly minted request id. `build` stamps that id into
+/// the frame. Shared by the upload, fetch, and delete helpers above.
+async fn file_request(
+    state: &TransportState,
+    server_id: &str,
+    build: impl FnOnce(String) -> ClientFrame,
+) -> Result<FileOpReply, String> {
+    let request_id = Uuid::new_v4().to_string();
+    let frame = build(request_id.clone());
+
+    let (tx, rx) = oneshot::channel();
+    state.pending_files.lock().await.insert(request_id.clone(), tx);
+
+    let send_result = {
+        let guard = state.connections.lock().await;
+        match guard.get(server_id) {
+            Some(conn) => conn.outbound.try_send(frame)
+                .map_err(|e| format!("server connection is not accepting frames; reconnect and try again: {e}")),
+            None => Err("server is not connected".to_string()),
+        }
+    };
+    if let Err(e) = send_result {
+        state.pending_files.lock().await.remove(&request_id);
+        return Err(e);
+    }
+
+    // Generous per-chunk budget: a 256 KiB chunk round-trip over a Tor circuit
+    // can be slow, especially right after the circuit is built.
+    match timeout(Duration::from_secs(90), rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_)) => {
+            state.pending_files.lock().await.remove(&request_id);
+            Err("file transfer reply channel closed".to_string())
+        }
+        Err(_) => {
+            state.pending_files.lock().await.remove(&request_id);
+            Err("timed out waiting for relay file transfer reply".to_string())
+        }
+    }
+}
+
+/// One downloaded chunk, still E2E-encrypted (base64, exactly as it sat on the
+/// relay). The caller decrypts and reassembles. `total_bytes` is the relay's
+/// declared size for the whole transfer, repeated on every chunk for a cheap
+/// consistency check.
+pub struct DownloadedChunk {
+    pub chunk_index: u32,
+    pub total_bytes: u64,
+    pub ciphertext_b64: String,
+}
+
+/// Download every chunk of `transfer_id` from `url` over a single WebSocket, so
+/// the whole transfer rides one warm Tor circuit instead of rebuilding one per
+/// chunk. Fetching needs no `Hello`, so this reaches any relay — including one
+/// where we hold no mailbox, which is the normal case since a file lives on the
+/// sender's relay, not the downloader's. Chunks are pushed in order to the
+/// returned receiver; the first `Err` ends the stream. The caller decrypts,
+/// reassembles, writes to disk, and reports progress.
+pub async fn download_transfer(
+    tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
+    url: String,
+    transfer_id: String,
+    total_chunks: u32,
+) -> Result<mpsc::Receiver<Result<DownloadedChunk, String>>, String> {
+    validate_ws_url(&url)?;
+    validate_bundle_id(&transfer_id)?;
+    if total_chunks == 0 { return Err("transfer declares no chunks".into()); }
+    let parsed = parse_ws_url(&url)?;
+    // A small buffer lets the network task stay a chunk or two ahead of the
+    // decrypt/write consumer without unbounded memory growth.
+    let (tx, rx) = mpsc::channel(4);
+    if parsed.host.ends_with(".onion") {
+        let stream = connect_onion_stream_with_retries(tor_client.clone(), &transfer_id, &parsed.host, parsed.port).await?;
+        let request = url.clone().into_client_request().map_err(|e| e.to_string())?;
+        let (ws, _) = client_async(request, stream).await.map_err(|e| format!("onion websocket handshake failed: {e}"))?;
+        tokio::spawn(run_download_transfer_ws(ws, transfer_id, total_chunks, tx));
+    } else {
+        if !parsed.is_local_dev_host() { return Err("direct WebSocket is only allowed for localhost development. Use a .onion server URL for real transport.".into()); }
+        let (ws, _) = connect_async(&url).await.map_err(|e| format!("websocket connect failed: {e}"))?;
+        tokio::spawn(run_download_transfer_ws(ws, transfer_id, total_chunks, tx));
+    }
+    Ok(rx)
+}
+
+async fn run_download_transfer_ws<S>(
+    mut ws: WebSocketStream<S>,
+    transfer_id: String,
+    total_chunks: u32,
+    tx: mpsc::Sender<Result<DownloadedChunk, String>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    for chunk_index in 0..total_chunks {
+        let request_id = Uuid::new_v4().to_string();
+        let frame = ClientFrame::FetchFileChunk { request_id: request_id.clone(), transfer_id: transfer_id.clone(), chunk_index };
+        if let Err(e) = send_frame(&mut ws, frame).await {
+            let _ = tx.send(Err(e)).await;
+            return;
+        }
+        let result = loop {
+            let response = match timeout(Duration::from_secs(90), ws.next()).await {
+                Ok(r) => r,
+                Err(_) => break Err("timed out waiting for file chunk".to_string()),
+            };
+            let Some(response) = response else { break Err("relay closed during file download".to_string()); };
+            let message = match response {
+                Ok(m) => m,
+                Err(e) => break Err(format!("websocket read failed: {e}")),
+            };
+            let text = match message {
+                Message::Text(t) => t,
+                Message::Close(_) => break Err("relay closed during file download".to_string()),
+                _ => continue, // ignore pings/pongs/binary and keep waiting
+            };
+            match serde_json::from_str::<ServerFrame>(&text) {
+                Ok(ServerFrame::FileChunk { request_id: got, chunk_index: got_idx, total_bytes, ciphertext, .. })
+                    if got == request_id && got_idx == chunk_index =>
+                {
+                    break Ok(DownloadedChunk { chunk_index, total_bytes, ciphertext_b64: ciphertext });
+                }
+                Ok(ServerFrame::FileError { code, message, .. }) => break Err(format!("{code}: {message}")),
+                Ok(_) => continue, // unrelated frame on this socket; keep reading
+                Err(e) => break Err(format!("bad server frame: {e}")),
+            }
+        };
+        let is_err = result.is_err();
+        if tx.send(result).await.is_err() { return; } // consumer dropped (cancelled)
+        if is_err { return; }
+    }
+    let _ = ws.close(None).await;
+}
+
 pub async fn retire_mailbox_once(
     tor_client: Arc<Mutex<Option<TorClient<PreferredRuntime>>>>,
     url: String,
@@ -922,6 +1157,8 @@ async fn run_connection(
     pending_certs: Arc<Mutex<HashMap<String, oneshot::Sender<SenderCertificateResponse>>>>,
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
+    pending_files: Arc<Mutex<HashMap<String, oneshot::Sender<FileOpReply>>>>,
+    server_file_limits: Arc<Mutex<HashMap<String, u64>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
     syncing_conns: Arc<Mutex<HashSet<String>>>,
     server_id: String,
@@ -943,13 +1180,13 @@ async fn run_connection(
         let (ws, _) = client_async(request, stream)
             .await
             .map_err(|e| format!("onion websocket handshake failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
     } else {
         if !parsed.is_local_dev_host() {
             return Err("direct WebSocket is only allowed for localhost development. Use a .onion server URL for real transport.".into());
         }
         let (ws, _) = connect_async(&url).await.map_err(|e| format!("websocket connect failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
     }
 }
 
@@ -958,6 +1195,8 @@ async fn run_websocket<S>(
     pending_certs: Arc<Mutex<HashMap<String, oneshot::Sender<SenderCertificateResponse>>>>,
     pending_token_updates: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     pending_sends: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SendEnvelopeAck, String>>>>>,
+    pending_files: Arc<Mutex<HashMap<String, oneshot::Sender<FileOpReply>>>>,
+    server_file_limits: Arc<Mutex<HashMap<String, u64>>>,
     server_trust_roots: Arc<Mutex<HashMap<String, String>>>,
     syncing_conns: Arc<Mutex<HashSet<String>>>,
     server_id: String,
@@ -1036,7 +1275,10 @@ where
         let Message::Text(text) = message else { continue; };
         let frame: ServerFrame = serde_json::from_str(&text).map_err(|e| format!("bad server frame: {e}"))?;
         match frame {
-            ServerFrame::HelloOk { protocol_version, trust_root_b64, server_time_ms, min_supported, current_protocol } => {
+            ServerFrame::HelloOk { protocol_version, trust_root_b64, server_time_ms, min_supported, current_protocol, max_file_bytes } => {
+                if let Some(limit) = max_file_bytes {
+                    server_file_limits.lock().await.insert(server_id.clone(), limit);
+                }
                 let local_time = now_ms();
                 let skew = if server_time_ms > local_time { server_time_ms - local_time } else { local_time - server_time_ms };
                 if skew > 5 * 60 * 1000 {
@@ -1148,6 +1390,26 @@ where
             ServerFrame::DeliveryTokensSet { request_id, .. } => {
                 if let Some(tx) = pending_token_updates.lock().await.remove(&request_id) {
                     let _ = tx.send(());
+                }
+            }
+            ServerFrame::FileChunkStored { request_id, received_chunks, total_chunks, .. } => {
+                if let Some(tx) = pending_files.lock().await.remove(&request_id) {
+                    let _ = tx.send(FileOpReply::ChunkStored { received_chunks, total_chunks });
+                }
+            }
+            ServerFrame::FileChunk { request_id, total_chunks, total_bytes, ciphertext, .. } => {
+                if let Some(tx) = pending_files.lock().await.remove(&request_id) {
+                    let _ = tx.send(FileOpReply::Chunk { total_chunks, total_bytes, ciphertext });
+                }
+            }
+            ServerFrame::TransferDeleted { request_id, .. } => {
+                if let Some(tx) = pending_files.lock().await.remove(&request_id) {
+                    let _ = tx.send(FileOpReply::Deleted);
+                }
+            }
+            ServerFrame::FileError { request_id, code, message, .. } => {
+                if let Some(tx) = pending_files.lock().await.remove(&request_id) {
+                    let _ = tx.send(FileOpReply::Error { code, message });
                 }
             }
             ServerFrame::AckOk { .. } => {}

@@ -667,6 +667,67 @@ async fn messaging_send_text_message(
     .map_err(|e| format!("message worker panicked or was cancelled: {e}"))?
 }
 
+#[tauri::command]
+async fn messaging_send_file_message(
+    app: AppHandle,
+    session: State<'_, AppSessionState>,
+    transport_state: State<'_, transport::TransportState>,
+    tor_state: State<'_, AppTorState>,
+    contact_id: String,
+    file_path: String,
+    message_id: String,
+) -> Result<messaging::SendMessageResponse, String> {
+    // Same non-Send constraint as send_text: run on a dedicated current-thread
+    // runtime inside a blocking worker.
+    let session = session.inner().clone();
+    let transport_state = transport_state.inner().clone();
+    let tor_client = tor_state.client.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start file worker runtime: {e}"))?
+            .block_on(messaging::send_file_message(
+                app,
+                &session,
+                &transport_state,
+                tor_client,
+                contact_id,
+                file_path,
+                message_id,
+            ))
+    })
+    .await
+    .map_err(|e| format!("file worker panicked or was cancelled: {e}"))?
+}
+
+#[tauri::command]
+async fn messaging_download_file(
+    app: AppHandle,
+    session: State<'_, AppSessionState>,
+    tor_state: State<'_, AppTorState>,
+    message_id: String,
+    save_path: String,
+) -> Result<messaging::StoredMessage, String> {
+    let session = session.inner().clone();
+    let tor_client = tor_state.client.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start download worker runtime: {e}"))?
+            .block_on(messaging::download_file(
+                app,
+                &session,
+                tor_client,
+                message_id,
+                save_path,
+            ))
+    })
+    .await
+    .map_err(|e| format!("download worker panicked or was cancelled: {e}"))?
+}
+
 
 #[tauri::command]
 async fn messaging_mark_message_relay_received(
@@ -803,6 +864,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // The updater is desktop-only; on mobile the plugin does not exist.
             // It downloads and verifies signed bundles from GitHub Releases; the
@@ -842,6 +904,8 @@ pub fn run() {
             messaging_snapshot,
             messaging_connect_all,
             messaging_send_text_message,
+            messaging_send_file_message,
+            messaging_download_file,
             messaging_mark_message_relay_received,
             messaging_mark_message_send_failed,
             messaging_mark_contact_verified,

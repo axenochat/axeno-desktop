@@ -1,14 +1,17 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Contact, Message } from "../../types";
-import { contactDisplayName, contactInitials, formatClockTime, formatDayDivider, isSameDay, isSameMinute } from "../../utils";
-import { IconDots, IconArrowUp } from "../icons";
+import { Contact, Message, FileProgress } from "../../types";
+import { contactDisplayName, contactInitials, formatClockTime, formatDayDivider, formatFileSize, isSameDay, isSameMinute } from "../../utils";
+import { IconDots, IconArrowUp, IconPaperclip, IconDownload, IconFile } from "../icons";
 import "./ChatView.css";
 
 interface Props {
   contact: Contact;
   messages: Message[];
+  fileProgress: Record<string, FileProgress>;
   onOpenChatSettings: () => void;
   onSendMessage: (text: string) => Promise<void>;
+  onSendFile: () => Promise<void>;
+  onDownloadFile: (msg: Message) => Promise<void>;
   sendOnEnter: boolean;
   messageTextSize: "small" | "medium" | "large";
 }
@@ -23,7 +26,7 @@ function messageStatusLabel(status?: string): string {
   }
 }
 
-export default function ChatView({ contact, messages, onOpenChatSettings, onSendMessage, sendOnEnter, messageTextSize }: Props) {
+export default function ChatView({ contact, messages, fileProgress, onOpenChatSettings, onSendMessage, onSendFile, onDownloadFile, sendOnEnter, messageTextSize }: Props) {
   const [input, setInput] = useState("");
   const [sendError, setSendError] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -71,6 +74,20 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
     });
   };
 
+  const attach = () => {
+    setSendError("");
+    onSendFile().catch(e => {
+      setSendError(typeof e === "string" ? e : "Could not send file");
+    });
+  };
+
+  const download = (msg: Message) => {
+    setSendError("");
+    onDownloadFile(msg).catch(e => {
+      setSendError(typeof e === "string" ? e : "Could not download file");
+    });
+  };
+
   return (
     <main className="chat-view">
       <header className="chat-header">
@@ -106,8 +123,10 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
               <div
                 className={`message-row ${msg.mine ? "mine" : "theirs"} ${isSequenceStart && prev && !showDivider ? "sequence-start" : ""}`}
               >
-                <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}`}>
-                  {msg.text}
+                <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}${msg.attachment ? " bubble-file" : ""}`}>
+                  {msg.attachment
+                    ? <FileBubble msg={msg} progress={fileProgress[msg.id]} onDownload={() => download(msg)} />
+                    : msg.text}
                 </div>
                 {showMeta && (
                   <div className="message-time">
@@ -123,6 +142,14 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
 
       <div className="chat-input-wrap">
         <div className="chat-input-row">
+          <button
+            className="chat-input-attach"
+            aria-label="Attach a file"
+            title="Attach a file"
+            onClick={attach}
+          >
+            <IconPaperclip />
+          </button>
           <input
             type="text"
             value={input}
@@ -143,5 +170,50 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
         {sendError && <div className="onboarding-error chat-error">{sendError}</div>}
       </div>
     </main>
+  );
+}
+
+function FileBubble({ msg, progress, onDownload }: { msg: Message; progress?: FileProgress; onDownload: () => void }) {
+  const att = msg.attachment!;
+  const state = att.downloadState ?? (msg.mine ? "downloaded" : "available");
+  // A live progress event wins over the stored state while a transfer runs.
+  const active = progress && !progress.done && !progress.error;
+  const pct = active && progress!.total > 0
+    ? Math.min(100, Math.round((progress!.transferred / progress!.total) * 100))
+    : null;
+
+  let action: React.ReactNode = null;
+  if (active) {
+    const verb = progress!.direction === "upload" ? "Uploading" : "Downloading";
+    action = <span className="file-status">{verb}{pct !== null ? ` ${pct}%` : "…"}</span>;
+  } else if (msg.mine) {
+    action = <span className="file-status">{state === "downloaded" ? "Sent" : "Sending…"}</span>;
+  } else if (state === "downloaded") {
+    action = <span className="file-status">Saved</span>;
+  } else if (state === "downloading") {
+    action = <span className="file-status">Downloading…</span>;
+  } else {
+    action = (
+      <button className="file-download" onClick={onDownload} aria-label="Download file" title="Download">
+        <IconDownload />
+      </button>
+    );
+  }
+
+  return (
+    <div className="file-bubble">
+      <div className="file-icon"><IconFile /></div>
+      <div className="file-meta">
+        <div className="file-name" title={att.fileName}>{att.fileName}</div>
+        <div className="file-sub">
+          {att.size > 0 ? formatFileSize(att.size) : ""}
+          {state === "failed" && <span className="file-failed"> · failed</span>}
+        </div>
+        {pct !== null && (
+          <div className="file-progress-track"><div className="file-progress-fill" style={{ width: `${pct}%` }} /></div>
+        )}
+      </div>
+      <div className="file-action">{action}</div>
+    </div>
   );
 }

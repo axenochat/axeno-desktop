@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Contact, Message } from "../../types";
-import { contactDisplayName, contactInitials, formatMessageTime, lastMessage, unreadCount } from "../../utils";
+import { contactDisplayName, contactInitials, formatMessageTime, lastMessage, messagePreview, unreadCount } from "../../utils";
 import { IconSearch, IconPlus, IconSettings } from "../icons";
 import "./Sidebar.css";
 
@@ -74,7 +74,8 @@ export default function Sidebar({
     if (!q) return contacts;
     return contacts.filter(c => {
       const msgs = allMessages[c.id] ?? [];
-      const last = lastMessage(msgs)?.text ?? "";
+      const lastMsg = lastMessage(msgs);
+      const last = lastMsg ? messagePreview(lastMsg) : "";
       return [contactDisplayName(c), c.recipientId ?? "", last].some(v => v.toLowerCase().includes(q));
     });
   }, [contacts, allMessages, query]);
@@ -108,7 +109,7 @@ export default function Sidebar({
           const isActive = c.id === activeContactId;
           const msgs = allMessages[c.id] ?? [];
           const last = lastMessage(msgs);
-          const preview = last?.text ?? "";
+          const preview = last ? messagePreview(last) : "";
           const time = last ? formatMessageTime(last.timestamp) : "";
           const unread = isActive ? 0 : unreadCount(msgs, c.lastReadAt);
           return (
