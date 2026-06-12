@@ -16,12 +16,10 @@ interface Props {
   onClose: () => void;
   displayName: string;
   onChangeName: (name: string) => void;
-  torStatus: "connecting" | "connected" | "failed";
-  torError?: string;
 }
 
 export default function Settings({
-  settings, onChange, onClose, displayName, onChangeName, torStatus, torError,
+  settings, onChange, onClose, displayName, onChangeName,
 }: Props) {
   const [section, setSection] = useState<Section>("identity");
 
@@ -46,7 +44,7 @@ export default function Settings({
           {section === "identity" && <IdentitySection displayName={displayName} onChangeName={onChangeName} inviteCodes={settings.inviteCodes} onChangeInviteCodes={(inviteCodes) => onChange({ ...settings, inviteCodes })} defaultServerUrl={defaultServerUrl(settings)} defaultServerName={defaultServerName(settings)} privateServers={settings.privateServers} />}
           {section === "servers" && <ServersSection settings={settings} onChange={onChange} />}
           {section === "appearance" && <AppearanceSection settings={settings} onChange={onChange} />}
-          {section === "about" && <AboutSection settings={settings} onChange={onChange} torStatus={torStatus} torError={torError} />}
+          {section === "about" && <AboutSection settings={settings} onChange={onChange} />}
         </main>
       </div>
     </div>
@@ -535,21 +533,16 @@ function AppearanceSection({ settings, onChange }: { settings: AppSettings; onCh
 }
 
 
-function AboutSection({ settings, onChange, torStatus, torError }: { settings: AppSettings; onChange: (s: AppSettings) => void; torStatus: "connecting" | "connected" | "failed"; torError?: string }) {
+function AboutSection({ settings, onChange }: { settings: AppSettings; onChange: (s: AppSettings) => void }) {
   // Show the real app version (from tauri.conf.json) so it can never drift from
   // what is published.
   const [version, setVersion] = useState("");
   useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
-  const torLabel =
-    torStatus === "connected" ? "Connected" :
-      torStatus === "connecting" ? "Bootstrapping..." :
-        `Failed${torError ? `: ${torError}` : ""}`;
 
   return (
     <Section title="About">
       <div className="about-block">
         <div className="about-row"><span>Version</span><span className="mono">{version || "..."}</span></div>
-        <div className="about-row"><span>Tor</span><span>{torLabel}</span></div>
       </div>
       <Row
         label="Check for updates"

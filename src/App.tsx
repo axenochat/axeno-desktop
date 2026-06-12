@@ -60,7 +60,7 @@ function groupMessages(snapshot: MessagingSnapshot): Record<string, Message[]> {
 export default function App() {
   const [appState, setAppState] = useState<"loading" | "onboarding" | "login" | "chat">("loading");
   const [torStatus, setTorStatus] = useState<TorStatus>("connecting");
-  const [torError, setTorError] = useState<string>("");
+  const [, setTorError] = useState<string>("");
 
   const [displayName, setDisplayName] = useState("");
 
@@ -463,7 +463,7 @@ export default function App() {
         <main className="chat-view empty-chat">Generate a connection code or add a contact to start messaging.</main>
       )}
 
-      {showSettings && <Settings settings={settings} onChange={setSettings} displayName={displayName} onChangeName={setDisplayName} onClose={() => setShowSettings(false)} torStatus={torStatus} torError={torError} />}
+      {showSettings && <Settings settings={settings} onChange={setSettings} displayName={displayName} onChangeName={setDisplayName} onClose={() => setShowSettings(false)} />}
       {showAddContact && <AddContact onClose={() => setShowAddContact(false)} onAdded={handleAddedContact} />}
       {showChatSettings && active && <ChatSettings contact={active} onClose={() => setShowChatSettings(false)} onOpenVerify={() => { setShowChatSettings(false); setShowVerify(true); }} onMigrateRelay={(code) => migrateContactRelay(active.id, code)} />}
       {showVerify && active && <VerifyIdentity contact={active} onClose={() => setShowVerify(false)} onContactUpdated={(updated) => setContacts(prev => prev.map(c => c.id === updated.id ? updated : c))} />}
