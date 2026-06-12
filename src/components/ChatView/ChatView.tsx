@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Contact, Message } from "../../types";
-import { contactDisplayName, contactInitials, formatMessageTime } from "../../utils";
+import { contactDisplayName, contactInitials, formatClockTime, formatDayDivider, isSameDay, isSameMinute } from "../../utils";
 import { IconDots, IconArrowUp } from "../icons";
 import "./ChatView.css";
 
@@ -84,28 +84,39 @@ export default function ChatView({ contact, messages, onOpenChatSettings, onSend
       </header>
 
       <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
-        <div className="date-divider">
-          <span className="date-line"></span>
-          <span className="date-label">Today</span>
-          <span className="date-line"></span>
-        </div>
-
         {messages.map((msg, i) => {
           const prev = messages[i - 1];
+          const next = messages[i + 1];
           const isSequenceStart = !prev || prev.mine !== msg.mine;
+          const showDivider = !prev || !isSameDay(prev.timestamp, msg.timestamp);
+          // Clump a run of same-sender messages from the same minute under one
+          // trailing timestamp; always surface a failed send.
+          const endOfClump = !next || next.mine !== msg.mine || !isSameMinute(msg.timestamp, next.timestamp);
+          const statusLabel = msg.mine ? messageStatusLabel(msg.status) : "";
+          const showMeta = endOfClump || msg.status === "send_failed";
           return (
-            <div
-              key={msg.id}
-              className={`message-row ${msg.mine ? "mine" : "theirs"} ${isSequenceStart && prev ? "sequence-start" : ""}`}
-            >
-              <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}`}>
-                {msg.text}
+            <Fragment key={msg.id}>
+              {showDivider && (
+                <div className="date-divider">
+                  <span className="date-line"></span>
+                  <span className="date-label">{formatDayDivider(msg.timestamp)}</span>
+                  <span className="date-line"></span>
+                </div>
+              )}
+              <div
+                className={`message-row ${msg.mine ? "mine" : "theirs"} ${isSequenceStart && prev && !showDivider ? "sequence-start" : ""}`}
+              >
+                <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}`}>
+                  {msg.text}
+                </div>
+                {showMeta && (
+                  <div className="message-time">
+                    {formatClockTime(msg.timestamp)}
+                    {statusLabel && <span className={`message-status status-${msg.status}`}> · {statusLabel}</span>}
+                  </div>
+                )}
               </div>
-              <div className="message-time">
-                {formatMessageTime(msg.timestamp)}
-                {msg.mine && messageStatusLabel(msg.status) && <span className={`message-status status-${msg.status}`}> · {messageStatusLabel(msg.status)}</span>}
-              </div>
-            </div>
+            </Fragment>
           );
         })}
       </div>

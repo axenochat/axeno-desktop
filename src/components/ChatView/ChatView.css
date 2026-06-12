@@ -75,7 +75,11 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 0 auto 18px;
+  margin: 14px auto 16px;
+}
+
+.date-divider:first-child {
+  margin-top: 0;
 }
 
 .date-line {
@@ -129,10 +133,11 @@
 }
 
 .message-time {
-  font-size: 10px;
+  font-size: 9.5px;
   color: var(--text-faint);
-  margin-top: 4px;
+  margin-top: 3px;
   padding: 0 4px;
+  letter-spacing: 0.02em;
   font-variant-numeric: tabular-nums;
 }
 

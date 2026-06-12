@@ -30,6 +30,12 @@ export default function ChatSettings({ contact, onClose, onOpenVerify, onMigrate
   const [migrationError, setMigrationError] = useState("");
   const [migrationBusy, setMigrationBusy] = useState(false);
 
+  const closeMigration = () => {
+    setShowMigration(false);
+    setMigrationCode("");
+    setMigrationError("");
+  };
+
   const submitMigration = async () => {
     const code = migrationCode.trim();
     if (!code) return;
@@ -37,8 +43,7 @@ export default function ChatSettings({ contact, onClose, onOpenVerify, onMigrate
     setMigrationBusy(true);
     try {
       await onMigrateRelay(code);
-      setMigrationCode("");
-      setShowMigration(false);
+      closeMigration();
     } catch (err) {
       setMigrationError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -60,52 +65,53 @@ export default function ChatSettings({ contact, onClose, onOpenVerify, onMigrate
         <div className="chat-settings-body">
           <div className="chat-settings-identity">
             <div className="chat-settings-avatar">{contactInitials(contact)}</div>
-            <div className="chat-settings-contact-id">{contactDisplayName(contact)}</div>
+            <div className="chat-settings-name">{contactDisplayName(contact)}</div>
+            <div className="chat-settings-relay" title={contact.serverUrl || "unknown"}>
+              {contact.serverUrl || "unknown relay"}
+            </div>
           </div>
 
-          <div className="chat-settings-action-list">
-            <button className="chat-settings-action" onClick={onOpenVerify}>
-              <span className="chat-settings-action-icon"><IconShield /></span>
-              <span className="chat-settings-action-label">Verify identity</span>
-              <span className={`chat-settings-action-status ${verifyStatusClass}`}>{verifyStatusText}</span>
-              <span className="chat-settings-action-chevron"><IconChevronRight /></span>
+          <div className="chat-settings-list">
+            <button className="chat-settings-row" onClick={onOpenVerify}>
+              <span className="chat-settings-row-icon"><IconShield /></span>
+              <span className="chat-settings-row-label">Verify identity</span>
+              <span className={`chat-settings-badge ${verifyStatusClass}`}>{verifyStatusText}</span>
+              <span className="chat-settings-row-chevron"><IconChevronRight /></span>
             </button>
-            <button className="chat-settings-action" onClick={() => setShowMigration(v => !v)}>
-              <span className="chat-settings-action-icon"><IconServer /></span>
-              <span className="chat-settings-action-label">Migrate relay</span>
-              <span className="chat-settings-action-status">Fresh code required</span>
-              <span className="chat-settings-action-chevron"><IconChevronRight /></span>
+
+            <button
+              className="chat-settings-row"
+              onClick={() => (showMigration ? closeMigration() : setShowMigration(true))}
+              aria-expanded={showMigration}
+            >
+              <span className="chat-settings-row-icon"><IconServer /></span>
+              <span className="chat-settings-row-label">Migrate relay</span>
+              <span className={`chat-settings-row-chevron ${showMigration ? "open" : ""}`}><IconChevronRight /></span>
             </button>
-          </div>
 
-          <section className="chat-settings-section">
-            <div className="chat-settings-section-title">Server</div>
-            <div className="chat-settings-section-desc">
-              Current relay: <span className="chat-settings-mono">{contact.serverUrl || "unknown"}</span>
-            </div>
-            <div className="chat-settings-section-desc">
-              Relay migration needs a fresh connection code from this same contact. Axeno refuses the move if the code has a different identity key.
-            </div>
-          </section>
-
-          {showMigration && (
-            <section className="chat-settings-section chat-settings-migration">
-              <div className="chat-settings-section-title">Fresh relay code</div>
-              <textarea
-                className="chat-settings-code-input"
-                placeholder="Paste their new connection code here"
-                value={migrationCode}
-                onChange={(e) => { setMigrationCode(e.target.value); setMigrationError(""); }}
-              />
-              {migrationError && <div className="chat-settings-error">{migrationError}</div>}
-              <div className="chat-settings-button-row">
-                <button className="btn btn-primary" onClick={submitMigration} disabled={migrationBusy || !migrationCode.trim()}>
-                  {migrationBusy ? "Migrating…" : "Accept migration"}
-                </button>
-                <button className="btn btn-secondary" onClick={() => { setShowMigration(false); setMigrationCode(""); setMigrationError(""); }} disabled={migrationBusy}>Cancel</button>
+            {showMigration && (
+              <div className="chat-settings-migrate">
+                <p className="chat-settings-migrate-hint">
+                  Paste a fresh connection code from this contact to move them to a new relay. Axeno rejects it if the identity key differs.
+                </p>
+                <textarea
+                  className="chat-settings-code-input"
+                  placeholder="Paste their new connection code"
+                  value={migrationCode}
+                  onChange={(e) => { setMigrationCode(e.target.value); setMigrationError(""); }}
+                  spellCheck={false}
+                  autoFocus
+                />
+                {migrationError && <div className="chat-settings-error">{migrationError}</div>}
+                <div className="chat-settings-migrate-actions">
+                  <button className="btn btn-secondary" onClick={closeMigration} disabled={migrationBusy}>Cancel</button>
+                  <button className="btn btn-primary" onClick={submitMigration} disabled={migrationBusy || !migrationCode.trim()}>
+                    {migrationBusy ? "Migrating…" : "Migrate"}
+                  </button>
+                </div>
               </div>
-            </section>
-          )}
+            )}
+          </div>
         </div>
       </aside>
     </>

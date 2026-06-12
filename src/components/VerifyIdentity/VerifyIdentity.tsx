@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { BackendContact, Contact, contactFromBackend } from "../../types";
-import { IconArrowLeft, IconCopy, IconCheck, IconShield } from "../icons";
+import { IconArrowLeft, IconCopy, IconCheck, IconShield, IconUserX } from "../icons";
 import { contactDisplayName } from "../../utils";
 import "./VerifyIdentity.css";
 
@@ -97,6 +97,13 @@ export default function VerifyIdentity({ contact, onClose, onContactUpdated }: P
   };
 
   const cannotVerify = contact.trustState === "identity_changed_blocked";
+  const bannerState = verified ? "verified" : cannotVerify ? "blocked" : "unverified";
+  const bannerTitle = verified ? "Verified" : cannotVerify ? "Identity changed" : "Not verified";
+  const bannerDesc = verified
+    ? "This contact is marked as verified on this device."
+    : cannotVerify
+      ? "Sending is blocked because this contact's identity key changed. Re-add them with a fresh code after checking out of band."
+      : "Confirm one of the methods below before you trust this identity.";
 
   return (
     <div className="verify-root">
@@ -104,84 +111,73 @@ export default function VerifyIdentity({ contact, onClose, onContactUpdated }: P
         <button className="verify-back" onClick={onClose} aria-label="Back">
           <IconArrowLeft />
         </button>
-        <div className="verify-topbar-title">Verify identity</div>
+        <div className="verify-topbar-title">Verify {contactDisplayName(contact)}</div>
       </header>
 
       <div className="verify-content">
-        <div className="verify-header">
-          <h1 className="verify-title">Verify {contactDisplayName(contact)}</h1>
-          <p className="verify-desc">
-            Verification proves this chat is bound to the identity key you expect. Compare the safety number live, or exchange verification codes through a trusted out-of-band channel. Do not use the same Axeno chat to verify itself.
-          </p>
-        </div>
-
-        <div className="verify-status-card">
-          <IconShield />
-          <div>
-            <div className="verify-status-title">{verified ? "Verified" : cannotVerify ? "Identity changed" : "Not verified"}</div>
-            <div className="verify-status-desc">
-              {verified
-                ? "This contact is marked as verified on this device."
-                : cannotVerify
-                  ? "Sending is blocked because this contact identity changed. Re-add them using a fresh code after checking out of band."
-                  : "Check the number or paste their verification code before trusting this identity."}
-            </div>
+        <div className={`verify-banner ${bannerState}`}>
+          <span className="verify-banner-icon">
+            {verified ? <IconCheck /> : cannotVerify ? <IconUserX /> : <IconShield />}
+          </span>
+          <div className="verify-banner-text">
+            <div className="verify-banner-title">{bannerTitle}</div>
+            <div className="verify-banner-desc">{bannerDesc}</div>
           </div>
         </div>
 
-        <div className="verify-divider">
-          <span>compare safety number</span>
-        </div>
-
-        <div className="verify-safety-number">
-          {Array.from({ length: 4 }).map((_, rowIdx) => (
-            <div key={rowIdx} className="verify-safety-row">
-              {groups.slice(rowIdx * 3, rowIdx * 3 + 3).map((g, i) => (
-                <span key={i} className="verify-safety-group">{g}</span>
-              ))}
-            </div>
-          ))}
-        </div>
-
-        <div className="verify-actions">
+        <section className="verify-method">
+          <div className="verify-method-head">
+            <h2 className="verify-method-title">Compare safety number</h2>
+            <p className="verify-method-desc">Read these digits aloud together over a trusted channel. If they match on both devices, mark this contact as verified.</p>
+          </div>
+          <div className="verify-safety-number">
+            {Array.from({ length: 4 }).map((_, rowIdx) => (
+              <div key={rowIdx} className="verify-safety-row">
+                {groups.slice(rowIdx * 3, rowIdx * 3 + 3).map((g, i) => (
+                  <span key={i} className="verify-safety-group">{g}</span>
+                ))}
+              </div>
+            ))}
+          </div>
           <button
-            className={`btn ${verified ? "btn-success" : "btn-primary"}`}
+            className={`btn ${verified ? "btn-success" : "btn-primary"} verify-full-btn`}
             onClick={compareManually}
             disabled={busy || cannotVerify}
           >
             {verified ? <><IconCheck /> Marked as verified</> : "I compared the number"}
           </button>
-        </div>
+        </section>
 
-        <div className="verify-divider">
-          <span>or exchange verification codes</span>
-        </div>
-
-        <div className="verify-code-card">
-          <div className="verify-code-label">Your code for them</div>
-          <div className="verify-code-value" title={myCode}>{myCode ? compactCode(myCode) : "Not available yet"}</div>
-          <button className="btn btn-secondary verify-code-copy" onClick={copyMyCode} disabled={!myCode}>
-            {copied ? <><IconCheck /> Copied</> : <><IconCopy /> Copy my code</>}
-          </button>
-        </div>
-
-        <div className="verify-code-card">
-          <div className="verify-code-label">Paste their code</div>
-          <textarea
-            className="verify-code-input"
-            placeholder="axv1_..."
-            value={theirCode}
-            onChange={(e) => { setTheirCode(e.target.value); setError(""); }}
-            spellCheck={false}
-          />
-          <button className="btn btn-primary verify-code-copy" onClick={verifyCode} disabled={busy || cannotVerify || !theirCode.trim()}>
-            Verify pasted code
-          </button>
-        </div>
+        <section className="verify-method">
+          <div className="verify-method-head">
+            <h2 className="verify-method-title">Exchange codes</h2>
+            <p className="verify-method-desc">Send your code to them out of band, then paste the one they send back.</p>
+          </div>
+          <div className="verify-code-field">
+            <div className="verify-code-label">Your code</div>
+            <div className="verify-code-value" title={myCode}>{myCode ? compactCode(myCode) : "Not available yet"}</div>
+            <button className="btn btn-secondary verify-full-btn" onClick={copyMyCode} disabled={!myCode}>
+              {copied ? <><IconCheck /> Copied</> : <><IconCopy /> Copy my code</>}
+            </button>
+          </div>
+          <div className="verify-code-field">
+            <div className="verify-code-label">Their code</div>
+            <textarea
+              className="verify-code-input"
+              placeholder="axv1_…"
+              value={theirCode}
+              onChange={(e) => { setTheirCode(e.target.value); setError(""); }}
+              spellCheck={false}
+            />
+            <button className="btn btn-primary verify-full-btn" onClick={verifyCode} disabled={busy || cannotVerify || !theirCode.trim()}>
+              Verify pasted code
+            </button>
+          </div>
+        </section>
 
         {error && <div className="onboarding-error">{error}</div>}
-        <p className="verify-fineprint">
-          Verification codes expire quickly and only work if their code names your identity and your stored contact identity. A relay cannot fake this without the contact's real Signal identity key.
+        <p className="verify-footnote">
+          A relay can never fake verification. It would need the contact's real identity key.
         </p>
       </div>
     </div>
