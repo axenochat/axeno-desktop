@@ -439,17 +439,40 @@ export default function App() {
     }
   };
 
+  // Stamp a download_state onto a message's attachment wherever it lives in the
+  // map. Used to flip the bubble to "downloading" the instant the user clicks,
+  // since the first progress event can lag behind Tor circuit setup.
+  const setAttachmentState = (messageId: string, downloadState: string) => {
+    setMessages(prev => {
+      const next = { ...prev };
+      for (const cid of Object.keys(next)) {
+        if (!next[cid].some(m => m.id === messageId)) continue;
+        next[cid] = next[cid].map(m => m.id === messageId && m.attachment
+          ? { ...m, attachment: { ...m.attachment, downloadState } }
+          : m);
+        break;
+      }
+      return next;
+    });
+  };
+
   const downloadFile = async (msg: Message) => {
     if (!msg.attachment) return;
     const savePath = await saveFileDialog({ defaultPath: msg.attachment.fileName, title: "Save file" });
     if (!savePath || typeof savePath !== "string") return;
-    const updated = await invoke<BackendMessage>("messaging_download_file", { messageId: msg.id, savePath });
-    const next = messageFromBackend(updated);
-    const contactId = updated.contact_id;
-    setMessages(prev => {
-      const existing = prev[contactId] ?? [];
-      return { ...prev, [contactId]: existing.map(m => m.id === next.id ? next : m) };
-    });
+    setAttachmentState(msg.id, "downloading");
+    try {
+      const updated = await invoke<BackendMessage>("messaging_download_file", { messageId: msg.id, savePath });
+      const next = messageFromBackend(updated);
+      const contactId = updated.contact_id;
+      setMessages(prev => {
+        const existing = prev[contactId] ?? [];
+        return { ...prev, [contactId]: existing.map(m => m.id === next.id ? next : m) };
+      });
+    } catch (e) {
+      setAttachmentState(msg.id, "failed");
+      throw e;
+    }
   };
 
   const migrateContactRelay = async (contactId: string, code: string) => {

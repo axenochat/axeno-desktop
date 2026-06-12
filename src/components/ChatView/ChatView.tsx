@@ -187,7 +187,10 @@ function FileBubble({ msg, progress, onDownload }: { msg: Message; progress?: Fi
     const verb = progress!.direction === "upload" ? "Uploading" : "Downloading";
     action = <span className="file-status">{verb}{pct !== null ? ` ${pct}%` : "…"}</span>;
   } else if (msg.mine) {
-    action = <span className="file-status">{state === "downloaded" ? "Sent" : "Sending…"}</span>;
+    // Our own files: the message-level status row ("sending"/"sent") already
+    // conveys delivery, so no redundant bubble label here. The upload % above
+    // covers the in-flight case.
+    action = null;
   } else if (state === "downloaded") {
     action = <span className="file-status">Saved</span>;
   } else if (state === "downloading") {
