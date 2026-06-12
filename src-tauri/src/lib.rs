@@ -59,6 +59,31 @@ pub struct AppSessionState {
     pub messaging_store_lock: Arc<Mutex<()>>,
 }
 
+/// Filesystem paths the user explicitly selected in a native, Rust-owned file
+/// dialog during this session. The file send/download commands only accept a
+/// path recorded here, so the webview can never name an arbitrary filesystem
+/// path — it can only echo back a path the user just picked.
+#[derive(Default)]
+pub struct ApprovedPathsState {
+    read: std::sync::Mutex<std::collections::HashSet<String>>,
+    write: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl ApprovedPathsState {
+    fn approve_read(&self, path: String) {
+        self.read.lock().unwrap_or_else(|p| p.into_inner()).insert(path);
+    }
+    fn approve_write(&self, path: String) {
+        self.write.lock().unwrap_or_else(|p| p.into_inner()).insert(path);
+    }
+    fn is_read_approved(&self, path: &str) -> bool {
+        self.read.lock().unwrap_or_else(|p| p.into_inner()).contains(path)
+    }
+    fn is_write_approved(&self, path: &str) -> bool {
+        self.write.lock().unwrap_or_else(|p| p.into_inner()).contains(path)
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct UnifiedAppStateFile {
     version: u16,
@@ -478,6 +503,71 @@ async fn tor_proxy_url(state: State<'_, AppTorState>) -> Result<Option<String>, 
 
 
 // --------------------------------------------------------------------------
+// File dialog commands (Rust-owned)
+// --------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFile {
+    pub path: String,
+    pub file_name: String,
+}
+
+/// Open a native file picker and record the chosen path as read-approved.
+/// Returns `None` when the user cancels. The dialog runs in Rust so the webview
+/// only ever learns paths the user explicitly selected.
+#[tauri::command]
+async fn pick_file_for_send(
+    app: AppHandle,
+    approved: State<'_, ApprovedPathsState>,
+) -> Result<Option<PickedFile>, String> {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().set_title("Send a file").blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("file dialog failed: {e}"))?;
+    let Some(file_path) = picked else { return Ok(None); };
+    let path = file_path
+        .into_path()
+        .map_err(|e| format!("unsupported file selection: {e}"))?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let path_str = path.to_string_lossy().to_string();
+    approved.approve_read(path_str.clone());
+    Ok(Some(PickedFile { path: path_str, file_name }))
+}
+
+/// Open a native save dialog and record the chosen path as write-approved.
+/// Returns `None` when the user cancels.
+#[tauri::command]
+async fn pick_save_path(
+    app: AppHandle,
+    approved: State<'_, ApprovedPathsState>,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .set_title("Save file")
+            .set_file_name(&default_name)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| format!("save dialog failed: {e}"))?;
+    let Some(file_path) = picked else { return Ok(None); };
+    let path = file_path
+        .into_path()
+        .map_err(|e| format!("unsupported save location: {e}"))?;
+    let path_str = path.to_string_lossy().to_string();
+    approved.approve_write(path_str.clone());
+    Ok(Some(path_str))
+}
+
+// --------------------------------------------------------------------------
 // WebSocket transport commands
 // --------------------------------------------------------------------------
 
@@ -673,10 +763,16 @@ async fn messaging_send_file_message(
     session: State<'_, AppSessionState>,
     transport_state: State<'_, transport::TransportState>,
     tor_state: State<'_, AppTorState>,
+    approved: State<'_, ApprovedPathsState>,
     contact_id: String,
     file_path: String,
     message_id: String,
 ) -> Result<messaging::SendMessageResponse, String> {
+    // Only paths the user explicitly picked in the Rust-owned file dialog are
+    // readable here; a compromised webview cannot name an arbitrary file.
+    if !approved.is_read_approved(&file_path) {
+        return Err("file was not selected through the app's file picker".into());
+    }
     // Same non-Send constraint as send_text: run on a dedicated current-thread
     // runtime inside a blocking worker.
     let session = session.inner().clone();
@@ -706,9 +802,16 @@ async fn messaging_download_file(
     app: AppHandle,
     session: State<'_, AppSessionState>,
     tor_state: State<'_, AppTorState>,
+    approved: State<'_, ApprovedPathsState>,
     message_id: String,
     save_path: String,
 ) -> Result<messaging::StoredMessage, String> {
+    // Only paths the user explicitly picked in the Rust-owned save dialog are
+    // writable here; a compromised webview cannot direct sender-controlled
+    // bytes to an arbitrary filesystem path.
+    if !approved.is_write_approved(&save_path) {
+        return Err("save location was not selected through the app's save dialog".into());
+    }
     let session = session.inner().clone();
     let tor_client = tor_state.client.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -879,6 +982,7 @@ pub fn run() {
             socks_port: Arc::new(Mutex::new(None)),
         })
         .manage(AppSessionState::default())
+        .manage(ApprovedPathsState::default())
         .manage(messaging::MessagingRuntimeState::new())
         .manage(transport::TransportState::new())
         .invoke_handler(tauri::generate_handler![
@@ -892,6 +996,8 @@ pub fn run() {
             change_password,
             bootstrap_tor,
             tor_proxy_url,
+            pick_file_for_send,
+            pick_save_path,
             messaging_load_private_server_settings,
             messaging_save_private_server_settings,
             messaging_generate_connection_code,

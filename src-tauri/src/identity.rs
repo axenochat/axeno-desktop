@@ -298,6 +298,23 @@ fn verify_unlocked_consistency(blob: &EncryptedIdentity, secrets: &VaultSecrets)
             return Err(IdentityError::Signal(format!("one-time prekey {} public key does not match its private key", public.id)));
         }
     }
+
+    // The reverse direction: every encrypted private key must still be advertised
+    // in the unencrypted shell. Without this, an attacker with write access could
+    // silently delete shell entries (shrinking the offered OPK pool or dropping a
+    // previous SPK) without breaking any of the forward checks above. The two
+    // sides are always mutated together (create/replenish/rotate), so a mismatch
+    // is tampering or corruption, never a legitimate state.
+    for secret in &secrets.opks_secret {
+        if !blob.opks_public.iter().any(|p| p.id == secret.id) {
+            return Err(IdentityError::Signal(format!("one-time prekey {} is missing from the vault shell", secret.id)));
+        }
+    }
+    for secret in &secrets.previous_spks_secret {
+        if !blob.previous_signed_prekeys.iter().any(|p| p.id == secret.id) {
+            return Err(IdentityError::Signal(format!("previous signed prekey {} is missing from the vault shell", secret.id)));
+        }
+    }
     Ok(())
 }
 
@@ -668,6 +685,16 @@ mod tests {
         let attacker = create_identity("pw2", "Mallory").unwrap();
         victim.blob.signed_prekey_public = attacker.blob.signed_prekey_public.clone();
         let err = unlock_identity(&victim.blob, "pw").unwrap_err();
+        assert!(matches!(err, IdentityError::Signal(_)));
+    }
+
+    #[test]
+    fn deleted_shell_opk_is_rejected() {
+        // An attacker with write access removes an advertised one-time prekey
+        // from the unencrypted shell while the encrypted private half remains.
+        let mut created = create_identity("pw", "Alice").unwrap();
+        created.blob.opks_public.remove(0);
+        let err = unlock_identity(&created.blob, "pw").unwrap_err();
         assert!(matches!(err, IdentityError::Signal(_)));
     }
 

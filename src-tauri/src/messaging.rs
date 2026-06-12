@@ -4337,7 +4337,14 @@ mod signal_protocol_engine {
                     contact.safety_number = pairwise_safety_number(&me.public_key, &identity_raw);
                 }
             } else if identity != contact.identity_public_b64 {
-                if let Some(c) = axeno_store.contacts.iter_mut().find(|c| c.recipient_id == contact.recipient_id) {
+                // `contact.recipient_id` may already have been reassigned to the
+                // advertised return mailbox above, so look the stored record up by
+                // the certificate mailbox or the previously pinned identity key —
+                // otherwise the block marker could land on no record at all.
+                if let Some(c) = axeno_store.contacts.iter_mut().find(|c| {
+                    c.recipient_id == cert_sender_uuid
+                        || (!contact.identity_public_b64.is_empty() && c.identity_public_b64 == contact.identity_public_b64)
+                }) {
                     c.trust_state = "identity_changed_blocked".to_string();
                     c.verified_at_ms = None;
                 }

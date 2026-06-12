@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import Sidebar from "./components/Sidebar/Sidebar";
 import ChatView from "./components/ChatView/ChatView";
 import Settings from "./components/Settings/Settings";
@@ -402,10 +401,12 @@ export default function App() {
   };
 
   const sendFile = async (contactId: string) => {
-    const selected = await openFileDialog({ multiple: false, title: "Send a file" });
-    if (!selected || typeof selected !== "string") return;
-    const filePath = selected;
-    const fileName = filePath.split(/[\\/]/).pop() || "file";
+    // The file dialog runs in Rust; the backend only accepts paths it handed
+    // out here, so the webview never names arbitrary filesystem paths.
+    const picked = await invoke<{ path: string; fileName: string } | null>("pick_file_for_send");
+    if (!picked) return;
+    const filePath = picked.path;
+    const fileName = picked.fileName;
     // Pre-generate the id so the optimistic bubble and the backend's upload
     // progress events line up on the same message.
     const messageId = (crypto as Crypto).randomUUID();
@@ -458,8 +459,10 @@ export default function App() {
 
   const downloadFile = async (msg: Message) => {
     if (!msg.attachment) return;
-    const savePath = await saveFileDialog({ defaultPath: msg.attachment.fileName, title: "Save file" });
-    if (!savePath || typeof savePath !== "string") return;
+    // The save dialog runs in Rust; the backend only writes to paths it handed
+    // out here.
+    const savePath = await invoke<string | null>("pick_save_path", { defaultName: msg.attachment.fileName });
+    if (!savePath) return;
     setAttachmentState(msg.id, "downloading");
     try {
       const updated = await invoke<BackendMessage>("messaging_download_file", { messageId: msg.id, savePath });
