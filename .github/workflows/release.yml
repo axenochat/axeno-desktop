@@ -80,7 +80,7 @@ jobs:
               "### macOS: first launch",
               "",
               "The app is not notarized by Apple. After opening the `.dmg` and dragging Axeno to your Applications folder, macOS will block the first launch with a security warning. Just run the command below before opening Axeno:",
-              "",
+              "",a
               "```",
               "xattr -cr /Applications/Axeno.app",
               "```",
