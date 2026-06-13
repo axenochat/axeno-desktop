@@ -6,6 +6,10 @@ This repository is the **desktop client**, built with [Tauri](https://tauri.app)
 
 > **Status:** early development, not independently audited. Do not rely on it where your safety is at stake.
 
+## Quick Demo Video
+
+https://github.com/axenochat/axeno-desktop/raw/refs/heads/main/demo/axeno-quick-demo.mp4
+
 ## Features
 
 - End-to-end encryption with the Signal Protocol, including double-ratchet forward secrecy and Kyber post-quantum prekeys
