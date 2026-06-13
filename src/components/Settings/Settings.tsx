@@ -292,7 +292,7 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
           <div className="inviteCodes-block-title">Connection Codes</div>
           <div className="inviteCodes-block-desc">
             Share a code with someone so they can start a conversation with you.
-            Each code gets its own routing mailbox and expires after 24 hours; deleting it disables your local receive route. Codes are stored only in the encrypted backend store, not browser storage.
+            Each code gets its own routing mailbox and expires after 30 days; deleting it disables your local receive route.
           </div>
         </div>
 

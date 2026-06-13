@@ -40,7 +40,10 @@ const PROTOCOL_SIGNAL: &str = "axeno_signal_v1";
 const ENVELOPE_TYPE_SIGNAL: &str = "axeno_signal_v1";
 const ENVELOPE_TYPE_SEALED_SIGNAL: &str = "axeno_sealed_signal_v1";
 const DEVICE_ID: u32 = 1;
-const CONNECTION_CODE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a connection code stays redeemable. Bounded on the relay by
+/// `MAX_BUNDLE_TTL_MS`, which is kept in sync at the same value; the client
+/// requests this TTL when uploading the invite bundle.
+const CONNECTION_CODE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const VERIFY_PREFIX: &str = "axv1_";
 const VERIFY_CODE_TTL_MS: u64 = 10 * 60 * 1000;
 const SIGNED_PREKEY_ROTATION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -846,9 +849,63 @@ fn load_store_with_keys(app: &AppHandle, current_key: &[u8; 32], legacy_key: &[u
     if let Some(store) = store_cache_get(current_key) {
         return Ok(store);
     }
-    let store = load_store_uncached(app, current_key, legacy_key)?;
+    let mut store = load_store_uncached(app, current_key, legacy_key)?;
+    // Self-heal stores that older builds fragmented into several contacts for one
+    // identity (connection-code re-adds used to dedup by mailbox id). Runs once
+    // per session on the cache-miss path; idempotent, so a clean store is a no-op.
+    if dedupe_contacts_by_identity(&mut store) {
+        save_store_with_key(app, &store, current_key)?;
+    }
     store_cache_set(current_key, &store);
     Ok(store)
+}
+
+/// Collapse contacts that share one Signal identity into a single canonical
+/// contact. Older builds dedup-ed connection-code re-adds by mailbox id, so a
+/// peer who shared a fresh code could accumulate several contacts (one per
+/// mailbox) for the same person, fragmenting the conversation across threads and
+/// causing a reply to surface in a different thread than the user was using.
+/// Keeps the best canonical contact (a visible one, then the one with the most
+/// recent message), repoints every message at it, and drops the duplicates.
+/// Their receive routes stay active, so inbound still merges by identity to the
+/// canonical contact. Returns true if it changed anything.
+fn dedupe_contacts_by_identity(store: &mut MessagingStore) -> bool {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in store.contacts.iter().enumerate() {
+        if c.identity_public_b64.is_empty() { continue; }
+        groups.entry(c.identity_public_b64.clone()).or_default().push(i);
+    }
+    // Most recent message time per contact id, for choosing the canonical thread.
+    let mut last_msg: HashMap<String, u64> = HashMap::new();
+    for m in &store.messages {
+        let t = m.received_at_ms.unwrap_or(m.timestamp).max(m.timestamp);
+        let e = last_msg.entry(m.contact_id.clone()).or_insert(0);
+        if t > *e { *e = t; }
+    }
+
+    let mut remap: HashMap<String, String> = HashMap::new(); // duplicate id -> canonical id
+    for idxs in groups.into_values() {
+        if idxs.len() < 2 { continue; }
+        let canonical = *idxs.iter().max_by_key(|&&i| {
+            let c = &store.contacts[i];
+            (!c.hidden, last_msg.get(&c.id).copied().unwrap_or(0), c.created_at_ms)
+        }).expect("non-empty group");
+        let canonical_id = store.contacts[canonical].id.clone();
+        for &i in &idxs {
+            if i != canonical {
+                remap.insert(store.contacts[i].id.clone(), canonical_id.clone());
+            }
+        }
+    }
+    if remap.is_empty() { return false; }
+
+    for m in store.messages.iter_mut() {
+        if let Some(canon) = remap.get(&m.contact_id) {
+            m.contact_id = canon.clone();
+        }
+    }
+    store.contacts.retain(|c| !remap.contains_key(&c.id));
+    true
 }
 
 fn load_store_uncached(app: &AppHandle, current_key: &[u8; 32], legacy_key: &[u8; 32]) -> Result<MessagingStore, String> {
@@ -1782,7 +1839,7 @@ fn contact_from_payload(payload: InvitePayload, local_identity_public: &[u8]) ->
     if payload.v != 1 || payload.protocol != PROTOCOL_SIGNAL { return Err("unsupported connection code protocol".into()); }
     let now = now_ms();
     // Reject codes claiming to be created far in the future — prevents a
-    // malicious generator from bypassing the 24-hour TTL by setting
+    // malicious generator from bypassing the connection-code TTL by setting
     // created_at_ms to a future timestamp.
     const MAX_CLOCK_DRIFT_MS: u64 = 5 * 60 * 1000;
     if payload.created_at_ms > now.saturating_add(MAX_CLOCK_DRIFT_MS) {
@@ -2322,7 +2379,20 @@ pub async fn add_contact_from_code(
         return Err("this identity has been blocked; unblock before re-adding".into());
     }
 
-    if let Some(pos) = store.contacts.iter().position(|c| c.recipient_id == contact.recipient_id) {
+    // Reuse an existing contact for the SAME identity rather than spawning a
+    // duplicate thread. A peer who shares a fresh connection code advertises a new
+    // mailbox id, so matching on recipient_id alone would treat every re-add as a
+    // brand-new contact and fragment the conversation. Match by stable identity
+    // first (preferring a visible contact, the thread the user already sees), and
+    // only fall back to a recipient_id match for legacy contacts with no pinned
+    // identity yet.
+    let incoming_identity = contact.identity_public_b64.clone();
+    let existing_pos = store.contacts
+        .iter()
+        .position(|c| !incoming_identity.is_empty() && c.identity_public_b64 == incoming_identity && !c.hidden)
+        .or_else(|| store.contacts.iter().position(|c| !incoming_identity.is_empty() && c.identity_public_b64 == incoming_identity))
+        .or_else(|| store.contacts.iter().position(|c| c.recipient_id == contact.recipient_id));
+    if let Some(pos) = existing_pos {
         if store.contacts[pos].identity_public_b64 != contact.identity_public_b64 && !store.contacts[pos].identity_public_b64.is_empty() {
             store.contacts[pos].trust_state = "identity_changed_blocked".to_string();
             store.contacts[pos].verified_at_ms = None;
@@ -2333,6 +2403,8 @@ pub async fn add_contact_from_code(
         let route = ensure_route_for_contact(&mut store, &contact_id, &contact.server_url)?;
         let existing = &mut store.contacts[pos];
         existing.display_name = contact.display_name.clone().or_else(|| existing.display_name.clone());
+        // A fresh code points at a new peer mailbox; adopt it as the send target.
+        existing.recipient_id = contact.recipient_id.clone();
         existing.server_url = contact.server_url.clone();
         existing.server_id = contact.server_id.clone();
         existing.identity_public_b64 = contact.identity_public_b64.clone();
@@ -4369,22 +4441,24 @@ mod signal_protocol_engine {
         if let Some(value) = decoded.sender_kyber_prekey_public_b64.clone() { contact.kyber_prekey_public_b64 = Some(value); }
         if let Some(value) = decoded.sender_kyber_prekey_signature_b64.clone() { contact.kyber_prekey_signature_b64 = Some(value); }
 
+        // Resolve the inbound message to an existing contact. Route-scoped sealed
+        // sender means the certificate sender UUID is the sender's current private
+        // return mailbox, not necessarily the mailbox from the original connection
+        // code, so we cannot rely on recipient_id alone — we merge by stable Signal
+        // identity. When a store has accumulated more than one contact for the same
+        // identity (e.g. a peer was re-added from a fresh code before identity
+        // dedup existed), prefer the VISIBLE contact: that is the thread the user
+        // is actually looking at, so a reply must not resurrect a stale hidden
+        // duplicate as a brand-new conversation.
+        let incoming_identity = contact.identity_public_b64.clone();
+        let same_identity = |c: &StoredContact| {
+            !incoming_identity.is_empty() && c.identity_public_b64 == incoming_identity
+        };
         let existing_pos = axeno_store.contacts
             .iter()
-            .position(|c| c.recipient_id == contact.recipient_id)
-            .or_else(|| {
-                // Route-scoped sealed sender deliberately means the certificate
-                // sender UUID is the sender's current private return mailbox,
-                // not necessarily the mailbox from the original connection code.
-                // If we already know this stable Signal identity under an older
-                // invite mailbox, merge the route update into that existing UI
-                // contact instead of creating a duplicate contact and fragmenting
-                // the session/message history.
-                if contact.identity_public_b64.is_empty() { return None; }
-                axeno_store.contacts
-                    .iter()
-                    .position(|c| !c.identity_public_b64.is_empty() && c.identity_public_b64 == contact.identity_public_b64)
-            });
+            .position(|c| same_identity(c) && !c.hidden)
+            .or_else(|| axeno_store.contacts.iter().position(|c| c.recipient_id == contact.recipient_id))
+            .or_else(|| axeno_store.contacts.iter().position(same_identity));
 
         if let Some(pos) = existing_pos {
             let existing = &mut axeno_store.contacts[pos];
@@ -4464,6 +4538,56 @@ mod route_tests {
             created_at_ms: now_ms(),
             last_read_at: None,
         }
+    }
+
+    fn test_message(id: &str, contact_id: &str, ts: u64) -> StoredMessage {
+        StoredMessage {
+            id: id.to_string(),
+            contact_id: contact_id.to_string(),
+            mine: false,
+            text: "hi".to_string(),
+            timestamp: ts,
+            received_at_ms: Some(ts),
+            status: "received".to_string(),
+            attachment: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_collapses_same_identity_into_visible_thread() {
+        let mut store = MessagingStore::default();
+        // Two contacts for the SAME identity ("identity"): an older hidden one and
+        // a newer visible one — exactly the fragmentation a code re-add produced.
+        let mut hidden_old = test_contact("old", "ws://r.onion/ws", None);
+        hidden_old.hidden = true;
+        hidden_old.created_at_ms = 100;
+        let mut visible_new = test_contact("new", "ws://r.onion/ws", None);
+        visible_new.hidden = false;
+        visible_new.created_at_ms = 200;
+        store.contacts.push(hidden_old);
+        store.contacts.push(visible_new);
+        store.messages.push(test_message("m1", "old", 50));
+        store.messages.push(test_message("m2", "new", 60));
+
+        assert!(dedupe_contacts_by_identity(&mut store));
+        // One canonical contact survives, and it is the visible thread.
+        assert_eq!(store.contacts.len(), 1);
+        assert_eq!(store.contacts[0].id, "new");
+        // Every message is repointed onto the canonical contact.
+        assert!(store.messages.iter().all(|m| m.contact_id == "new"));
+    }
+
+    #[test]
+    fn dedupe_is_noop_for_distinct_identities() {
+        let mut store = MessagingStore::default();
+        let mut a = test_contact("a", "ws://r.onion/ws", None);
+        a.identity_public_b64 = "id_a".to_string();
+        let mut b = test_contact("b", "ws://r.onion/ws", None);
+        b.identity_public_b64 = "id_b".to_string();
+        store.contacts.push(a);
+        store.contacts.push(b);
+        assert!(!dedupe_contacts_by_identity(&mut store));
+        assert_eq!(store.contacts.len(), 2);
     }
 
     #[test]
