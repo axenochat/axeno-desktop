@@ -28,11 +28,11 @@ Download the latest build for your platform from the [Releases](https://github.c
 
 The app is not notarized by Apple. After opening the `.dmg` and dragging Axeno to your Applications folder, macOS will block the first launch with a security warning. To open it:
 
-**Option A — System Settings:** Open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the Axeno message.
+**Option A - System Settings:** Open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the Axeno message.
 
-**Option B — Finder:** Right-click **Axeno.app** in your Applications folder, choose **Open**, then click **Open** in the dialog that appears.
+**Option B - Finder:** Right-click **Axeno.app** in your Applications folder, choose **Open**, then click **Open** in the dialog that appears.
 
-**Option C — Terminal:**
+**Option C - Terminal:**
 
 ```
 xattr -cr /Applications/Axeno.app
