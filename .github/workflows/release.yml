@@ -70,10 +70,32 @@ jobs:
                 await github.rest.repos.deleteRelease({ owner, repo, release_id: r.id });
               }
             }
+            const body = [
+              "See the assets below to download and install Axeno.",
+              "",
+              "- **macOS**: `.dmg` (Apple Silicon or Intel)",
+              "- **Windows**: `-setup.exe` (x64 or ARM64)",
+              "- **Linux**: `.AppImage` (x86_64 or aarch64; requires FUSE / `libfuse2`)",
+              "",
+              "### macOS: first launch",
+              "",
+              "The app is not notarized by Apple. After opening the `.dmg` and dragging Axeno to your Applications folder, macOS will block the first launch with a security warning. To open it:",
+              "",
+              "**Option A — System Settings:** Open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the Axeno message.",
+              "",
+              "**Option B — Finder:** Right-click **Axeno.app** in your Applications folder, choose **Open**, then click **Open** in the dialog that appears.",
+              "",
+              "**Option C — Terminal:**",
+              "```",
+              "xattr -cr /Applications/Axeno.app",
+              "```",
+              "",
+              "You only need to do this once.",
+            ].join("\n");
             const res = await github.rest.repos.createRelease({
               owner, repo, tag_name: tag,
               name: `Axeno ${tag}`,
-              body: 'See the assets below to download and install Axeno.',
+              body,
               draft: true, prerelease: false,
             });
             return res.data.id;
