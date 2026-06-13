@@ -434,7 +434,7 @@ function ServersSection({ settings, onChange }: { settings: AppSettings; onChang
   return (
     <Section
       title="Select default server"
-      description="Your connection codes will route through the server you select here. This does not apply to connection codes you receive from others; those will route through the server they were generated with."
+      description="New connection codes will route through the server you select here. This does not apply to connection codes you receive from others; or codes previously generated. Those will route through the server they were generated with."
     >
       <div className="server-list">
         {settings.privateServers.length === 0 && (

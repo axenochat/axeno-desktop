@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 130 130" width="130" height="130" role="img" aria-label="Axeno app icon">
+<rect x="0" y="0" width="130" height="130" rx="28" fill="#15161c"/>
+<path d="M29.8 86.3 A46 46 0 1 1 45.9 99.4 Q37 106 25 105 Q24 95 29.8 86.3 Z" fill="none" stroke="#e9ebf2" stroke-width="5" stroke-linecap="round" stroke-linejoin="miter" opacity="0.55"/>
+<circle cx="66" cy="58" r="33" fill="none" stroke="#e9ebf2" stroke-width="5" opacity="0.78"/>
+<circle cx="66" cy="58" r="20" fill="none" stroke="#e9ebf2" stroke-width="5" opacity="0.95"/>
+<circle cx="66" cy="54" r="6.5" fill="#7c5cff"/>
+<rect x="63" y="56" width="6" height="12" rx="2" fill="#7c5cff"/>
+</svg>
