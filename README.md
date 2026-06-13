@@ -33,6 +33,9 @@ xattr -cr /Applications/Axeno.app
 
 You only need to do this once. After the first approved launch the app opens normally.
 
+I may change this in future, but for now it's not feasible, and trivially fixable anyway.
+
+
 ## Updating
 
 The app checks for updates on launch and prompts before installing a new signed release. By default the check and download are routed through Tor, so GitHub does not see your IP. GitHub sometimes blocks Tor, in which case the update fails and you can retry or turn off **Update over Tor** in **Settings → About**; you can also disable update checks there entirely (please don't do this).
