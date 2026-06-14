@@ -8,7 +8,7 @@ This repository is the **desktop client**, built with [Tauri](https://tauri.app)
 
 ## Quick Demo Video
 
-https://github.com/axenochat/axeno-desktop/raw/refs/heads/main/demo/axeno-quick-demo.mp4
+https://github.com/user-attachments/assets/a48901fd-2cf7-4b42-bda8-3d623e44ae17
 
 ## Features
 
