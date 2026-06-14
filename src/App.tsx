@@ -132,6 +132,13 @@ export default function App() {
   }, [settings.staggerConnections]);
 
   useEffect(() => {
+    invoke("messaging_set_jitter_maxes", {
+      connectMaxSecs: settings.connectJitterMaxSecs,
+      shutdownMaxSecs: settings.shutdownJitterMaxSecs,
+    }).catch(() => {});
+  }, [settings.connectJitterMaxSecs, settings.shutdownJitterMaxSecs]);
+
+  useEffect(() => {
     if (appState !== "chat" || !serverSettingsLoaded) return;
     const defaultServerUrl = settings.defaultServer.kind === "private"
       ? settings.privateServers.find(s => s.id === (settings.defaultServer as { kind: "private"; serverId: string }).serverId)?.onion ?? null

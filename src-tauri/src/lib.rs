@@ -592,6 +592,12 @@ fn messaging_set_stagger_connections(enabled: bool) {
 }
 
 #[tauri::command]
+fn messaging_set_jitter_maxes(connect_max_secs: u64, shutdown_max_secs: u64) {
+    messaging::set_connect_jitter_max_ms(connect_max_secs.saturating_mul(1_000));
+    transport::set_shutdown_jitter_max_ms(shutdown_max_secs.saturating_mul(1_000));
+}
+
+#[tauri::command]
 async fn transport_disconnect_server(
     state: State<'_, transport::TransportState>,
     server_id: String,
@@ -991,6 +997,7 @@ pub fn run() {
             transport_disconnect_server,
             transport_disconnect_all_staggered,
             messaging_set_stagger_connections,
+            messaging_set_jitter_maxes,
             transport_ack_envelopes,
             transport_list_connections,
         ])

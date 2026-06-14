@@ -535,17 +535,62 @@ function AppearanceSection({ settings, onChange }: { settings: AppSettings; onCh
 }
 
 
+function JitterSlider({ value, min, max, onChange }: { value: number; min: number; max: number; onChange: (v: number) => void }) {
+  return (
+    <div className="jitter-slider-wrap">
+      <input
+        type="range"
+        className="jitter-slider"
+        min={min}
+        max={max}
+        step={1}
+        value={value}
+        onChange={e => onChange(Number(e.target.value))}
+      />
+      <span className="jitter-value">{value}s</span>
+    </div>
+  );
+}
+
 function PrivacySection({ settings, onChange }: { settings: AppSettings; onChange: (s: AppSettings) => void }) {
   return (
     <Section
       title="Privacy"
-      description="These settings can help you reduce the chance of being fingerprinted by your connection patterns. They are opt-out because they can be a little annoying, but we recommend you keep then on."
+      description="These settings can help you reduce the chance of being fingerprinted by your connection patterns. They are opt-out because they can be a little annoying, but we recommend you keep them on."
     >
       <Row
         label="Stagger connection timing"
         description="Connect and disconnect each conversation's relay link on random delays, so a logging relay can't group your contacts by them all coming online or going offline at once. Adds a short delay when opening and closing the app."
         control={<Toggle on={settings.staggerConnections} onChange={(v) => onChange({ ...settings, staggerConnections: v })} />}
       />
+      {settings.staggerConnections && (
+        <>
+          <Row
+            label="Connect jitter window"
+            description="Each relay link picks a random delay in [0, this] before connecting at startup. Larger window = stronger privacy, longer wait."
+            control={
+              <JitterSlider
+                value={settings.connectJitterMaxSecs}
+                min={1}
+                max={60}
+                onChange={v => onChange({ ...settings, connectJitterMaxSecs: v })}
+              />
+            }
+          />
+          <Row
+            label="Disconnect jitter window"
+            description="Each relay link picks a random delay in [0, this] before closing at shutdown."
+            control={
+              <JitterSlider
+                value={settings.shutdownJitterMaxSecs}
+                min={1}
+                max={60}
+                onChange={v => onChange({ ...settings, shutdownJitterMaxSecs: v })}
+              />
+            }
+          />
+        </>
+      )}
     </Section>
   );
 }

@@ -841,3 +841,25 @@
 .settings-inline-error {
   margin-top: 8px;
 }
+
+/* Jitter window slider */
+
+.jitter-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.jitter-slider {
+  width: 110px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.jitter-value {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  min-width: 28px;
+  text-align: right;
+}

@@ -346,13 +346,18 @@ pub struct ShutdownProgress {
 }
 
 /// Longest random delay before any one socket is closed during staggered
-/// shutdown. Kept short so quitting still feels responsive.
-const SHUTDOWN_STAGGER_MAX_MS: u64 = 6_000;
+/// shutdown. Mutable at runtime so the user can tune it in Settings.
+static SHUTDOWN_STAGGER_MAX_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6_000);
+
+pub fn set_shutdown_jitter_max_ms(ms: u64) {
+    SHUTDOWN_STAGGER_MAX_MS.store(ms.clamp(1_000, 60_000), std::sync::atomic::Ordering::Relaxed);
+}
 
 fn random_stagger_delay() -> Duration {
     let mut buf = [0u8; 8];
     if getrandom::getrandom(&mut buf).is_err() { return Duration::ZERO; }
-    Duration::from_millis(u64::from_le_bytes(buf) % (SHUTDOWN_STAGGER_MAX_MS + 1))
+    let max = SHUTDOWN_STAGGER_MAX_MS.load(std::sync::atomic::Ordering::Relaxed);
+    Duration::from_millis(u64::from_le_bytes(buf) % (max + 1))
 }
 
 /// Close every live relay connection on an independent, randomly staggered

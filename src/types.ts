@@ -90,6 +90,12 @@ export interface AppSettings {
   // group your per-contact mailboxes by a synchronized burst of connects/closes.
   // Costs a brief delay opening and closing the app. Opt-out (defaults on).
   staggerConnections: boolean;
+  // Maximum random delay window (seconds) for staggering relay connections at
+  // startup. Each route picks independently in [0, this]. 1–60s, default 20s.
+  connectJitterMaxSecs: number;
+  // Maximum random delay window (seconds) for staggering relay disconnects at
+  // shutdown. Each socket picks independently in [0, this]. 1–60s, default 6s.
+  shutdownJitterMaxSecs: number;
 }
 
 export const defaultSettings: AppSettings = {
@@ -106,6 +112,8 @@ export const defaultSettings: AppSettings = {
   autoUpdateCheck: true,
   updateOverTor: true,
   staggerConnections: true,
+  connectJitterMaxSecs: 20,
+  shutdownJitterMaxSecs: 6,
 };
 
 export interface BackendContact {

@@ -1078,8 +1078,13 @@ fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_defa
 fn fill_random(buf: &mut [u8]) -> Result<(), String> { getrandom::getrandom(buf).map_err(|e| format!("OS randomness unavailable: {e}")) }
 
 /// Upper bound on the random per-route startup delay used to stagger connection
-/// establishment at unlock (see `jittered_connect_delay`).
-const CONNECT_JITTER_MAX_MS: u64 = 20_000;
+/// establishment at unlock (see `jittered_connect_delay`). Mutable at runtime
+/// so the user can tune it in Settings without restarting.
+static CONNECT_JITTER_MAX_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20_000);
+
+pub fn set_connect_jitter_max_ms(ms: u64) {
+    CONNECT_JITTER_MAX_MS.store(ms.clamp(1_000, 60_000), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// A random delay in `[0, CONNECT_JITTER_MAX_MS]` for staggering one route's
 /// connection.
@@ -1098,7 +1103,8 @@ fn jittered_connect_delay() -> std::time::Duration {
     // Best effort: if OS randomness is unavailable, connect immediately rather
     // than failing the whole connect.
     if fill_random(&mut buf).is_err() { return std::time::Duration::ZERO; }
-    let ms = u64::from_le_bytes(buf) % (CONNECT_JITTER_MAX_MS + 1);
+    let max = CONNECT_JITTER_MAX_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let ms = u64::from_le_bytes(buf) % (max + 1);
     std::time::Duration::from_millis(ms)
 }
 
