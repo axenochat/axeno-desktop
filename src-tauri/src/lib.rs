@@ -154,15 +154,7 @@ fn save_unified_state(app: &AppHandle, state: &UnifiedAppStateFile) -> Result<()
 
 // The message/contact store is no longer mirrored into axeno.state on every save
 // (messages.store is the single source of truth; see encrypt_and_write_store).
-// Retained for the one-time migration read path and possible future use.
-#[allow(dead_code)]
-pub(crate) fn update_unified_message_store(app: &AppHandle, store_json: Vec<u8>) -> Result<(), String> {
-    let mut unified = load_unified_state(app).unwrap_or_else(|_| UnifiedAppStateFile { version: 1, ..Default::default() });
-    unified.version = 1;
-    unified.messages_store_json = Some(store_json);
-    save_unified_state(app, &unified)
-}
-
+// axeno.state is read once for migration of any pre-existing mirror.
 pub(crate) fn read_unified_message_store(app: &AppHandle) -> Result<Option<Vec<u8>>, String> {
     Ok(load_unified_state(app)?.messages_store_json)
 }
@@ -586,6 +578,20 @@ async fn transport_connect_server(
 }
 
 #[tauri::command]
+async fn transport_disconnect_all_staggered(
+    app: AppHandle,
+    state: State<'_, transport::TransportState>,
+) -> Result<(), String> {
+    transport::disconnect_all_staggered(&app, state.inner()).await;
+    Ok(())
+}
+
+#[tauri::command]
+fn messaging_set_stagger_connections(enabled: bool) {
+    messaging::set_stagger_connections(enabled);
+}
+
+#[tauri::command]
 async fn transport_disconnect_server(
     state: State<'_, transport::TransportState>,
     server_id: String,
@@ -912,44 +918,6 @@ async fn messaging_update_contact_server(
     messaging::update_contact_server(app, &session, contact_id, server_url).await
 }
 
-// This handler is no longer exposed as a Tauri command — envelope processing
-// now happens directly in the Rust transport layer (M2 security fix). Kept as
-// an internal helper for potential debugging use.
-#[allow(dead_code)]
-async fn messaging_handle_incoming_envelope(
-    app: AppHandle,
-    session: State<'_, AppSessionState>,
-    runtime: State<'_, messaging::MessagingRuntimeState>,
-    transport_state: State<'_, transport::TransportState>,
-    tor_state: State<'_, AppTorState>,
-    server_id: String,
-    envelope: transport::StoredEnvelope,
-) -> Result<(), String> {
-    // Same deal as send: sealed-sender decrypt uses non-Send libsignal futures,
-    // so isolate it on a worker thread instead of freezing the command loop.
-    let session = session.inner().clone();
-    let runtime = runtime.inner().clone();
-    let transport_state = transport_state.inner().clone();
-    let tor_client = tor_state.client.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("could not start message worker runtime: {e}"))?
-            .block_on(messaging::handle_incoming_envelope(
-                app,
-                &session,
-                &runtime,
-                &transport_state,
-                tor_client,
-                server_id,
-                envelope,
-            ))
-    })
-    .await
-    .map_err(|e| format!("message worker panicked or was cancelled: {e}"))?
-}
-
 // --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
@@ -965,7 +933,6 @@ pub fn run() {
     std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1022,6 +989,8 @@ pub fn run() {
             messaging_update_contact_server,
             transport_connect_server,
             transport_disconnect_server,
+            transport_disconnect_all_staggered,
+            messaging_set_stagger_connections,
             transport_ack_envelopes,
             transport_list_connections,
         ])

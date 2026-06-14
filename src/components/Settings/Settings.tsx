@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { AppSettings, InviteCode, PrivateServer, ServerChoice } from "../../types";
 import {
-  IconArrowLeft, IconKey, IconServer, IconEye,
+  IconArrowLeft, IconKey, IconServer, IconEye, IconShield,
   IconInfo, IconCopy, IconPlus, IconTrash, IconCheck, IconChevronDown, IconEdit,
 } from "../icons";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import "./Settings.css";
 
-type Section = "identity" | "servers" | "appearance" | "about";
+type Section = "identity" | "servers" | "appearance" | "privacy" | "about";
 
 interface Props {
   settings: AppSettings;
@@ -37,6 +37,7 @@ export default function Settings({
           <NavItem icon={<IconKey />} label="Identity" active={section === "identity"} onClick={() => setSection("identity")} />
           <NavItem icon={<IconServer />} label="Servers" active={section === "servers"} onClick={() => setSection("servers")} />
           <NavItem icon={<IconEye />} label="Appearance" active={section === "appearance"} onClick={() => setSection("appearance")} />
+          <NavItem icon={<IconShield />} label="Privacy" active={section === "privacy"} onClick={() => setSection("privacy")} />
           <NavItem icon={<IconInfo />} label="About" active={section === "about"} onClick={() => setSection("about")} />
         </nav>
 
@@ -44,6 +45,7 @@ export default function Settings({
           {section === "identity" && <IdentitySection displayName={displayName} onChangeName={onChangeName} inviteCodes={settings.inviteCodes} onChangeInviteCodes={(inviteCodes) => onChange({ ...settings, inviteCodes })} defaultServerUrl={defaultServerUrl(settings)} defaultServerName={defaultServerName(settings)} privateServers={settings.privateServers} />}
           {section === "servers" && <ServersSection settings={settings} onChange={onChange} />}
           {section === "appearance" && <AppearanceSection settings={settings} onChange={onChange} />}
+          {section === "privacy" && <PrivacySection settings={settings} onChange={onChange} />}
           {section === "about" && <AboutSection settings={settings} onChange={onChange} />}
         </main>
       </div>
@@ -527,6 +529,22 @@ function AppearanceSection({ settings, onChange }: { settings: AppSettings; onCh
         label="Send with Enter"
         description="When off, only Ctrl+Enter sends."
         control={<Toggle on={settings.sendOnEnter} onChange={(v) => onChange({ ...settings, sendOnEnter: v })} />}
+      />
+    </Section>
+  );
+}
+
+
+function PrivacySection({ settings, onChange }: { settings: AppSettings; onChange: (s: AppSettings) => void }) {
+  return (
+    <Section
+      title="Privacy"
+      description="Hardening against a relay that logs connection metadata. Your IP is never exposed regardless (relays are Tor hidden services)."
+    >
+      <Row
+        label="Stagger connection timing"
+        description="Connect and disconnect each conversation's relay link on random delays, so a logging relay can't group your contacts by them all coming online or going offline at once. Adds a short delay when opening and closing the app."
+        control={<Toggle on={settings.staggerConnections} onChange={(v) => onChange({ ...settings, staggerConnections: v })} />}
       />
     </Section>
   );

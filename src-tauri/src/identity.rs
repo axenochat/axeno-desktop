@@ -13,7 +13,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
-use libsignal_protocol::{IdentityKey, IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
+use libsignal_protocol::{IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use serde::{Deserialize, Serialize};
@@ -582,19 +582,6 @@ pub fn rotate_signed_prekey_if_due(
 /// Hex-encoded fingerprint of the public identity key.
 pub fn fingerprint(blob: &EncryptedIdentity) -> String {
     hex::encode(&blob.public_key)
-}
-
-/// Validate that a stored blob can be reconstructed into a libsignal IdentityKey.
-/// Useful as a smoke test after loading from disk.
-pub fn verify_blob_structure(blob: &EncryptedIdentity) -> Result<(), IdentityError> {
-    IdentityKey::decode(&blob.public_key).map_err(|e| IdentityError::Signal(e.to_string()))?;
-    PublicKey::deserialize(&blob.signed_prekey_public)
-        .map_err(|e| IdentityError::Signal(e.to_string()))?;
-    for opk in &blob.opks_public {
-        PublicKey::deserialize(&opk.public_key)
-            .map_err(|e| IdentityError::Signal(e.to_string()))?;
-    }
-    Ok(())
 }
 
 // --- Tests ----------------------------------------------------------------

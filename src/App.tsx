@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Sidebar from "./components/Sidebar/Sidebar";
 import ChatView from "./components/ChatView/ChatView";
 import Settings from "./components/Settings/Settings";
@@ -85,6 +86,17 @@ export default function App() {
   // relay's `synced` marker). The cap only guards against a missed event.
   const [syncing, setSyncing] = useState(false);
   const syncCapTimerRef = useRef<number | null>(null);
+
+  // Staggered-shutdown overlay: while closing, we hold the window and close the
+  // relay sockets on independent random delays so a logging relay can't see all
+  // our mailboxes drop at once. The ref lets the server-status listener know not
+  // to fight the teardown with auto-reconnects.
+  const [shuttingDown, setShuttingDown] = useState(false);
+  const [shutdownProgress, setShutdownProgress] = useState<{ closed: number; total: number }>({ closed: 0, total: 0 });
+  const shuttingDownRef = useRef(false);
+  // Mirror of settings.staggerConnections for the close-intercept handler (whose
+  // effect captures props once) and to push the preference to the backend.
+  const staggerRef = useRef(true);
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
       return parseStoredSettings(localStorage.getItem("axeno.settings.v1"));
@@ -104,6 +116,13 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem("axeno.settings.v1", JSON.stringify(sanitizeSettingsForStorage(settings))); } catch {}
   }, [settings]);
+
+  // Push the connection-timing-obfuscation preference to the backend (which gates
+  // the staggered connect) and mirror it into a ref for the close handler.
+  useEffect(() => {
+    staggerRef.current = settings.staggerConnections;
+    invoke("messaging_set_stagger_connections", { enabled: settings.staggerConnections }).catch(() => {});
+  }, [settings.staggerConnections]);
 
   useEffect(() => {
     if (appState !== "chat" || !serverSettingsLoaded) return;
@@ -211,6 +230,9 @@ export default function App() {
     });
 
     const unlistenServerStatus = listen<ServerStatusEvent>("axeno-server-status", (event) => {
+      // While quitting, the staggered teardown intentionally disconnects every
+      // socket; don't schedule auto-reconnects that would race the shutdown.
+      if (shuttingDownRef.current) return;
       const { server_id: serverId, status } = event.payload;
       if (status === "ready" || status === "connected" || status === "connecting") {
         const existing = reconnectTimersRef.current[serverId];
@@ -333,6 +355,32 @@ export default function App() {
       reconnectTimersRef.current = {};
     };
   }, [loadMessaging, loadPrivateServerSettings, markContactRead, applySyncStatus]);
+
+  // Intercept the window close: hold it open, stagger-close the relay sockets so
+  // a logging relay can't see all our mailboxes drop in one burst, then destroy
+  // the window. See transport::disconnect_all_staggered.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const unlistenProgress = listen<{ closed: number; total: number }>("axeno-shutdown-progress", (e) => {
+      setShutdownProgress(e.payload);
+    });
+    const unlistenClose = win.onCloseRequested(async (event) => {
+      if (shuttingDownRef.current) return; // teardown already running
+      if (!staggerRef.current) return; // feature off — allow the normal immediate close
+      event.preventDefault();
+      shuttingDownRef.current = true;
+      setShutdownProgress({ closed: 0, total: 0 });
+      setShuttingDown(true);
+      try {
+        await invoke("transport_disconnect_all_staggered");
+      } catch { /* best effort — close regardless */ }
+      await win.destroy();
+    });
+    return () => {
+      unlistenProgress.then(f => f());
+      unlistenClose.then(f => f());
+    };
+  }, []);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -538,6 +586,22 @@ export default function App() {
 
   const active = contacts.find(c => c.id === activeContactIdForUi) || contacts[0];
 
+
+  if (shuttingDown) {
+    const { closed, total } = shutdownProgress;
+    const pct = total > 0 ? Math.round((closed / total) * 100) : 100;
+    return (
+      <div className="app-root app-centered">
+        <div className="shutdown-overlay">
+          <div className="onboarding-spinner app-loading-spinner" />
+          <p className="shutdown-title">Randomising connection closes…</p>
+          <p className="shutdown-subtitle">Staggering relay disconnects so your mailboxes can’t be linked.</p>
+          <div className="shutdown-bar"><div className="shutdown-bar-fill" style={{ width: `${pct}%` }} /></div>
+          {total > 0 && <p className="shutdown-count">{closed} / {total}</p>}
+        </div>
+      </div>
+    );
+  }
 
   if (appState === "loading") {
     return <div className="app-root app-centered"><div className="onboarding-spinner app-loading-spinner" /></div>;

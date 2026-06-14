@@ -1077,6 +1077,45 @@ pub fn promote_rekey_sidecar(app: &AppHandle, new_root_key: &[u8; 32]) -> Result
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 fn fill_random(buf: &mut [u8]) -> Result<(), String> { getrandom::getrandom(buf).map_err(|e| format!("OS randomness unavailable: {e}")) }
 
+/// Upper bound on the random per-route startup delay used to stagger connection
+/// establishment at unlock (see `jittered_connect_delay`).
+const CONNECT_JITTER_MAX_MS: u64 = 20_000;
+
+/// A random delay in `[0, CONNECT_JITTER_MAX_MS]` for staggering one route's
+/// connection.
+///
+/// Co-presence hardening: the relay can't observe which Tor circuit a connection
+/// rode (it sits behind a localhost onion forward — see `pool_key` in
+/// transport.rs), but it can see *when* each mailbox comes online. Connecting all
+/// of this client's mailboxes in one burst at unlock would let a logging relay
+/// group them as one user by their synchronized appearance. An independent random
+/// delay per route breaks that burst. This is a partial mitigation only: it does
+/// not decorrelate the offline edge (closing the app drops every socket at once)
+/// or clustering across many sessions — full unobservability is a mixnet, a
+/// deliberate non-goal for a real-time messenger.
+fn jittered_connect_delay() -> std::time::Duration {
+    let mut buf = [0u8; 8];
+    // Best effort: if OS randomness is unavailable, connect immediately rather
+    // than failing the whole connect.
+    if fill_random(&mut buf).is_err() { return std::time::Duration::ZERO; }
+    let ms = u64::from_le_bytes(buf) % (CONNECT_JITTER_MAX_MS + 1);
+    std::time::Duration::from_millis(ms)
+}
+
+/// User-toggleable switch for connection-timing obfuscation (the jittered connect
+/// here and, on the frontend, the staggered close). Defaults to on; the frontend
+/// pushes the persisted preference via `set_stagger_connections` on startup and
+/// whenever the user flips it in settings.
+static STAGGER_CONNECTIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn stagger_connections_enabled() -> bool {
+    STAGGER_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_stagger_connections(enabled: bool) {
+    STAGGER_CONNECTIONS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fresh_signal_rng() -> Result<ChaCha20Rng, String> {
     let mut seed = [0u8; 32];
     fill_random(&mut seed)?;
@@ -1137,19 +1176,6 @@ fn random_token(prefix: &str, bytes: usize) -> Result<String, String> {
     let mut raw = vec![0u8; bytes];
     fill_random(&mut raw)?;
     Ok(format!("{}{}", prefix, URL_SAFE_NO_PAD.encode(raw)))
-}
-
-#[allow(dead_code)]
-fn ensure_local_profile(store: &mut MessagingStore) -> Result<LocalProfile, String> {
-    if let Some(profile) = store.local_profile.clone() { return Ok(profile); }
-    let profile = LocalProfile {
-        mailbox_id: random_token("mbx_", 24)?,
-        receive_auth_token: random_token("rx_", 32)?,
-        delivery_token: random_token("dt_", 32)?,
-        created_at_ms: now_ms(),
-    };
-    store.local_profile = Some(profile.clone());
-    Ok(profile)
 }
 
 fn new_local_route(server_url: String, scope: String, expires_at_ms: Option<u64>) -> Result<LocalRoute, String> {
@@ -1562,62 +1588,6 @@ fn prune_expired_token_retirements(route: &mut LocalRoute) -> bool {
     before != route.pending_token_retirements.len()
 }
 
-#[allow(dead_code)]
-async fn rotate_route_delivery_token_after_confirmed(
-    transport_state: &transport::TransportState,
-    route: &mut LocalRoute,
-) -> Result<bool, String> {
-    normalize_legacy_retired_tokens(route);
-    let old_token = route.delivery_token.clone();
-    let new_token = random_token("dt_", 32)?;
-    let new_epoch = route.delivery_token_epoch.saturating_add(1).max(2);
-    let mut allowlist = vec![new_token.clone(), old_token.clone()];
-    for retired in &route.pending_token_retirements {
-        if !allowlist.iter().any(|token| token == &retired.token) { allowlist.push(retired.token.clone()); }
-    }
-    transport::set_delivery_tokens_confirmed(
-        transport_state,
-        route_connection_id(route),
-        allowlist,
-    ).await?;
-    route.delivery_token = new_token;
-    route.delivery_token_epoch = new_epoch;
-    route.pending_token_retirements.push(RetiredDeliveryToken {
-        token: old_token,
-        epoch: new_epoch.saturating_sub(1).max(1),
-        retire_after_ms: now_ms().saturating_add(DELIVERY_TOKEN_FALLBACK_TTL_MS),
-    });
-    Ok(true)
-}
-
-#[allow(dead_code)]
-async fn retire_acknowledged_route_tokens(
-    transport_state: &transport::TransportState,
-    route: &mut LocalRoute,
-    acked_epoch: Option<u64>,
-) -> Result<bool, String> {
-    normalize_legacy_retired_tokens(route);
-    let mut changed = prune_expired_token_retirements(route);
-    let before = route.pending_token_retirements.len();
-    if let Some(acked) = acked_epoch {
-        if acked >= route.delivery_token_epoch {
-            route.pending_token_retirements.clear();
-        }
-    }
-    if before != route.pending_token_retirements.len() { changed = true; }
-    if changed {
-        transport::set_delivery_tokens_confirmed(
-            transport_state,
-            route_connection_id(route),
-            route_delivery_allowlist(route),
-        ).await?;
-    }
-    Ok(changed)
-}
-
-#[allow(dead_code)]
-fn token_hash(token: &str) -> String { hex::encode(Sha256::digest(token.as_bytes())) }
-
 fn pairwise_safety_number(local_identity_public: &[u8], remote_identity_public: &[u8]) -> String {
     let (first, second) = if local_identity_public <= remote_identity_public {
         (local_identity_public, remote_identity_public)
@@ -1649,11 +1619,6 @@ fn decode_invite_code(code: &str) -> Result<DecodedInviteCode, String> {
     serde_json::from_slice::<InvitePayload>(&bytes)
         .map(DecodedInviteCode::Direct)
         .map_err(|e| format!("connection code payload is invalid: {e}"))
-}
-
-#[allow(dead_code)]
-fn payload_to_code(payload: &InvitePayload) -> Result<String, String> {
-    Ok(format!("{}{}", INVITE_PREFIX, URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).map_err(|e| e.to_string())?)))
 }
 
 fn hosted_code_to_code(payload: &HostedInviteCode) -> Result<String, String> {
@@ -2532,13 +2497,23 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
         });
     }
 
-    let mut tasks = Vec::new();
+    // Establish each route's connection on an independent, randomly staggered
+    // schedule rather than all at once, so a logging relay can't group this
+    // client's mailboxes by a synchronized burst of appearances at unlock (see
+    // `jittered_connect_delay`). We spawn detached and return without awaiting:
+    // the spread happens in the background over the jitter window and the UI is
+    // not blocked for its full duration — per-route status still arrives via the
+    // transport's status events, and offline backlog is replayed once each route
+    // connects.
     for route in routes {
         let app_clone = app.clone();
         let transport_state_clone = transport_state.clone();
         let tor_client_clone = tor_client.clone();
-        
-        tasks.push(tokio::spawn(async move {
+
+        tokio::spawn(async move {
+            if stagger_connections_enabled() {
+                tokio::time::sleep(jittered_connect_delay()).await;
+            }
             let connection_id = route_connection_id(&route);
             let _ = transport::connect_server(
                 app_clone,
@@ -2554,10 +2529,7 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
             if allowlist.len() > 1 {
                 let _ = transport::set_delivery_tokens_confirmed(&transport_state_clone, connection_id, allowlist).await;
             }
-        }));
-    }
-    for task in tasks {
-        let _ = task.await;
+        });
     }
     for contact_id in route_sync_contacts {
         let app_clone = app.clone();
@@ -4444,7 +4416,7 @@ mod signal_protocol_engine {
         // Resolve the inbound message to an existing contact. Route-scoped sealed
         // sender means the certificate sender UUID is the sender's current private
         // return mailbox, not necessarily the mailbox from the original connection
-        // code, so we cannot rely on recipient_id alone — we merge by stable Signal
+        // code, so we cannot rely on recipient_id alone - we merge by stable Signal
         // identity. When a store has accumulated more than one contact for the same
         // identity (e.g. a peer was re-added from a fresh code before identity
         // dedup existed), prefer the VISIBLE contact: that is the thread the user

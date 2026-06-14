@@ -10,7 +10,7 @@ use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{mpsc, oneshot, Mutex}, time::{sleep, timeout, Duration, Instant}};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{mpsc, oneshot, Mutex, Notify}, time::{sleep, timeout, Duration, Instant}};
 use tokio_tungstenite::{connect_async, client_async, tungstenite::{client::IntoClientRequest, Message}, WebSocketStream};
 use tor_rtcompat::PreferredRuntime;
 use uuid::Uuid;
@@ -33,6 +33,31 @@ const ONION_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(150);
 /// both keeps the circuit warm and surfaces a dead circuit fast (the failed
 /// write tears the connection down and triggers the frontend reconnect).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Proof-of-work difficulty: the required number of leading zero bits on the
+/// SHA-256 of the challenge. This MUST equal the relay's `POW_LEADING_ZERO_BITS`
+/// (axeno-relay `config.rs`). The relay rejects any PoW with fewer leading zero
+/// bits, so to change it, ship the higher client value first and only then raise
+/// the relay. Keeping it a single named constant (read by `pow_hash_ok` below)
+/// removes the old hand-inlined bit test that silently encoded "22" in three
+/// places.
+const POW_LEADING_ZERO_BITS: u32 = 22;
+
+/// True if `hash` begins with at least [`POW_LEADING_ZERO_BITS`] zero bits.
+/// Mirrors the relay's `pow_hash_ok` (axeno-relay `util.rs`) byte-for-byte so the
+/// two ends never disagree on how the bit count is read off the digest.
+fn pow_hash_ok(hash: &[u8]) -> bool {
+    let mut bits = POW_LEADING_ZERO_BITS;
+    for &byte in hash {
+        if bits == 0 { break; }
+        if bits >= 8 {
+            if byte != 0 { return false; }
+            bits -= 8;
+        } else {
+            return (byte >> (8 - bits)) == 0;
+        }
+    }
+    true
+}
 
 #[derive(Clone, Default)]
 pub struct TransportState {
@@ -64,6 +89,11 @@ struct ServerConnection {
     recipient_id: String,
     instance_id: Uuid,
     outbound: mpsc::Sender<ClientFrame>,
+    /// Fires a graceful close of this connection's read loop so the underlying
+    /// Tor stream is dropped on demand — letting staggered shutdown make the relay
+    /// see this mailbox go offline at its own time, rather than every socket
+    /// dropping together when the process exits.
+    shutdown: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,9 +120,7 @@ async fn generate_pow(recipient_id: &str) -> String {
         loop {
             let input = format!("{prefix}{nonce}");
             let hash = Sha256::digest(input.as_bytes());
-            // 22 leading zero bits. MUST match the relay's POW_LEADING_ZERO_BITS
-            // / pow_hash_ok check in axeno-relay (config.rs/util.rs).
-            if hash[0] == 0 && hash[1] == 0 && (hash[2] >> 2) == 0 {
+            if pow_hash_ok(&hash) {
                 return format!("{ts_window}:{nonce}");
             }
             nonce += 1;
@@ -238,7 +266,8 @@ pub async fn connect_server(
 
     let (tx, rx) = mpsc::channel::<ClientFrame>(OUTBOUND_QUEUE_CAPACITY);
     let instance_id = Uuid::new_v4();
-    guard.insert(server_id.clone(), ServerConnection { url: url.clone(), recipient_id: recipient_id.clone(), instance_id, outbound: tx.clone() });
+    let shutdown = Arc::new(Notify::new());
+    guard.insert(server_id.clone(), ServerConnection { url: url.clone(), recipient_id: recipient_id.clone(), instance_id, outbound: tx.clone(), shutdown: shutdown.clone() });
     drop(guard);
 
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -259,7 +288,7 @@ pub async fn connect_server(
         // the Tor connect + handshake, so marking here — not at HelloOk — keeps
         // the indicator on through the slow part too.
         set_conn_syncing(&app_for_task, &syncing_conns, &task_server_id, true).await;
-        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, Some(ready_tx)).await;
+        let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, shutdown, Some(ready_tx)).await;
         remove_connection_if_same(&connections, &task_server_id, instance_id).await;
         // Cleanup: if the connection ended before `Synced` (e.g. it failed during
         // connect), clear its syncing flag so the indicator can't stick.
@@ -300,22 +329,59 @@ pub async fn disconnect_server(
     state: &TransportState,
     server_id: String,
 ) -> Result<(), String> {
-    state.connections.lock().await.remove(&server_id);
+    // Removing drops the outbound sender (ending the writer); the explicit
+    // shutdown signal additionally breaks the read loop so the Tor stream is
+    // dropped now and the relay observes the disconnect, instead of the socket
+    // lingering until the process exits.
+    if let Some(conn) = state.connections.lock().await.remove(&server_id) {
+        conn.shutdown.notify_one();
+    }
     Ok(())
 }
 
-pub async fn set_delivery_tokens(
-    state: &TransportState,
-    server_id: String,
-    tokens: Vec<String>,
-) -> Result<(), String> {
-    if tokens.is_empty() { return Err("delivery-token allowlist may not be empty".into()); }
-    for token in &tokens { validate_token(token, "delivery token")?; }
-    let request_id = Uuid::new_v4().to_string();
-    let guard = state.connections.lock().await;
-    let conn = guard.get(&server_id).ok_or_else(|| "server is not connected".to_string())?;
-    conn.outbound.try_send(ClientFrame::SetDeliveryTokens { request_id, tokens })
-        .map_err(|e| format!("server connection is not accepting frames; reconnect and try again: {e}"))
+#[derive(Debug, Clone, Serialize)]
+pub struct ShutdownProgress {
+    pub closed: usize,
+    pub total: usize,
+}
+
+/// Longest random delay before any one socket is closed during staggered
+/// shutdown. Kept short so quitting still feels responsive.
+const SHUTDOWN_STAGGER_MAX_MS: u64 = 6_000;
+
+fn random_stagger_delay() -> Duration {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() { return Duration::ZERO; }
+    Duration::from_millis(u64::from_le_bytes(buf) % (SHUTDOWN_STAGGER_MAX_MS + 1))
+}
+
+/// Close every live relay connection on an independent, randomly staggered
+/// schedule — the offline counterpart to the jittered connect (see messaging
+/// `jittered_connect_delay`). Dropping every socket at once on quit would let a
+/// logging relay see this client's mailboxes all go offline in one burst and
+/// group them as one user; spreading the closes breaks that signal. Emits
+/// `axeno-shutdown-progress` as each socket closes so the UI can hold a progress
+/// bar, and resolves once the last one is closed.
+pub async fn disconnect_all_staggered(app: &AppHandle, state: &TransportState) {
+    let ids: Vec<String> = state.connections.lock().await.keys().cloned().collect();
+    let total = ids.len();
+    let _ = app.emit("axeno-shutdown-progress", ShutdownProgress { closed: 0, total });
+    if total == 0 { return; }
+
+    let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for id in ids {
+        let state = state.clone();
+        let app = app.clone();
+        let closed = closed.clone();
+        handles.push(tokio::spawn(async move {
+            sleep(random_stagger_delay()).await;
+            let _ = disconnect_server(&state, id).await;
+            let n = closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let _ = app.emit("axeno-shutdown-progress", ShutdownProgress { closed: n, total });
+        }));
+    }
+    for h in handles { let _ = h.await; }
 }
 
 pub async fn set_delivery_tokens_confirmed(
@@ -411,50 +477,45 @@ pub async fn send_envelope(
     }
 }
 
-/// Push a send-envelope frame onto the existing connection's outbound channel
-/// without waiting for the relay's ack. The WebSocket reader loop will emit
-/// `axeno-send-receipt` or `axeno-send-failed` events when the relay responds.
-/// Returns immediately after the channel push succeeds.
-pub async fn send_envelope_nowait(
-    state: &TransportState,
-    server_id: String,
-    to: String,
-    delivery_token: String,
-    envelope_type: String,
-    ciphertext: String,
-    client_ref: Option<String>,
-) -> Result<(), String> {
-    validate_recipient_id(&to)?;
-    validate_token(&delivery_token, "delivery token")?;
-    if envelope_type.len() > 32 { return Err("envelope_type is too long".into()); }
-    if ciphertext.len() > 512 * 1024 { return Err("ciphertext exceeds 512 KiB frame limit".into()); }
+/// Number of Tor circuits in the per-relay pool. Streams are spread across this
+/// many circuits per onion host for failure isolation (one dead circuit only
+/// stalls a fraction of routes, not all of them) and to avoid head-of-line
+/// blocking (a large file transfer can't choke every chat that shares one
+/// circuit). It is deliberately small — see `pool_key` for why circuit isolation
+/// is NOT a privacy feature here.
+const CIRCUIT_POOL_SIZE: u64 = 3;
 
-    let guard = state.connections.lock().await;
-    match guard.get(&server_id) {
-        Some(conn) => conn.outbound.try_send(ClientFrame::SendEnvelope {
-            client_ref,
-            to,
-            delivery_token,
-            envelope_type,
-            ciphertext,
-        }).map_err(|e| format!("server connection is not accepting frames; reconnect and try again: {e}")),
-        None => Err("server is not connected".to_string()),
-    }
-}
-
-/// Stable Tor stream-isolation token for an isolation key (a mailbox/route id).
-///
-/// Streams sharing a key may share a Tor circuit; streams with different keys are
-/// forced onto separate circuits. Keying by mailbox keeps each of this client's
-/// mailboxes on its own circuit, so a relay or exit cannot correlate two of the
-/// user's mailboxes by observing that they ride the same circuit. The token is
-/// generated once per key and reused, so reconnects for the same mailbox reuse
-/// its circuit pool instead of churning a fresh circuit each time.
+/// Stable Tor stream-isolation token for a pool key. Streams sharing a token may
+/// share a Tor circuit; streams with different tokens are forced onto separate
+/// circuits. The token is generated once per key and reused, so reconnects map
+/// back to the same pool circuit instead of churning a fresh circuit each time.
 fn isolation_token_for(key: &str) -> IsolationToken {
     static TOKENS: OnceLock<std::sync::Mutex<HashMap<String, IsolationToken>>> = OnceLock::new();
     let tokens = TOKENS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = tokens.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard.entry(key.to_string()).or_insert_with(IsolationToken::new)
+}
+
+/// Map a route/mailbox/transfer id to one of a small fixed pool of circuits for
+/// the given onion host.
+///
+/// We deliberately do NOT isolate per mailbox for anonymity. The relay terminates
+/// its onion service with a stock `HiddenServicePort .. 127.0.0.1:<port>` forward
+/// (see axeno-relay `tor.rs`), so it sees only loopback TCP connections and has no
+/// visibility into which Tor circuit a connection rode. Per-mailbox circuits would
+/// therefore hide nothing from the relay that the mailbox ids and connect/
+/// disconnect timing don't already reveal — and there is no exit node for an onion
+/// service to correlate at either. So isolation buys no unlinkability here; the
+/// only reasons to split circuits are reliability and head-of-line blocking, which
+/// a tiny pool serves at a fraction of the rendezvous-circuit and keepalive cost
+/// of one circuit per mailbox. Bucketing is stable across runs, so a given id
+/// keeps reusing the same pool circuit across reconnects.
+fn pool_key(host: &str, isolation_key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    isolation_key.hash(&mut hasher);
+    let bucket = hasher.finish() % CIRCUIT_POOL_SIZE;
+    format!("{host}#{bucket}")
 }
 
 async fn connect_onion_stream_with_retries(
@@ -465,7 +526,7 @@ async fn connect_onion_stream_with_retries(
 ) -> Result<DataStream, String> {
     let client = tor_client.lock().await.clone().ok_or_else(|| "Tor is not bootstrapped yet; call bootstrap_tor first".to_string())?;
     let mut prefs = StreamPrefs::new();
-    prefs.set_isolation(isolation_token_for(isolation_key));
+    prefs.set_isolation(isolation_token_for(&pool_key(host, isolation_key)));
     let started = Instant::now();
     let mut attempt = 0u32;
 
@@ -1167,6 +1228,7 @@ async fn run_connection(
     auth_token: String,
     delivery_token: String,
     outbound_rx: mpsc::Receiver<ClientFrame>,
+    shutdown: Arc<Notify>,
     ready_tx: Option<oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), String> {
     let parsed = parse_ws_url(&url)?;
@@ -1180,13 +1242,13 @@ async fn run_connection(
         let (ws, _) = client_async(request, stream)
             .await
             .map_err(|e| format!("onion websocket handshake failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, shutdown, ws, ready_tx).await
     } else {
         if !parsed.is_local_dev_host() {
             return Err("direct WebSocket is only allowed for localhost development. Use a .onion server URL for real transport.".into());
         }
         let (ws, _) = connect_async(&url).await.map_err(|e| format!("websocket connect failed: {e}"))?;
-        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, ws, ready_tx).await
+        run_websocket(app, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, server_trust_roots, syncing_conns, server_id, recipient_id, auth_token, delivery_token, outbound_rx, shutdown, ws, ready_tx).await
     }
 }
 
@@ -1204,6 +1266,7 @@ async fn run_websocket<S>(
     auth_token: String,
     delivery_token: String,
     mut outbound_rx: mpsc::Receiver<ClientFrame>,
+    shutdown: Arc<Notify>,
     ws: WebSocketStream<S>,
     mut ready_tx: Option<oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), String>
@@ -1264,7 +1327,16 @@ where
     // when the connection ends so a stale timer can't clear a later reconnect.
     let mut sync_fallback: Option<tokio::task::JoinHandle<()>> = None;
 
-    while let Some(message) = read.next().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            // Graceful close requested (staggered app shutdown). Break so the
+            // stream is dropped below, closing the Tor stream now — the relay
+            // sees this mailbox go offline at its own staggered time.
+            _ = shutdown.notified() => break,
+            msg = read.next() => msg,
+        };
+        let Some(message) = next else { break; };
         let message = match message {
             Ok(m) => m,
             Err(e) => {
@@ -1651,6 +1723,22 @@ mod tests {
                 assert_eq!(response.expires_at_ms, 123);
             }
             CertificateReadResult::KeepReading => panic!("matching certificate should complete request"),
+        }
+    }
+
+    #[test]
+    fn pow_hash_ok_matches_legacy_22_bit_check() {
+        // The helper must accept exactly what the old hand-inlined test did at 22
+        // bits: hash[0]==0 && hash[1]==0 && (hash[2] >> 2) == 0.
+        assert_eq!(POW_LEADING_ZERO_BITS, 22);
+        let legacy = |h: &[u8; 3]| h[0] == 0 && h[1] == 0 && (h[2] >> 2) == 0;
+        for a in [0u8, 1, 0xff] {
+            for b in [0u8, 1, 0xff] {
+                for c in 0u8..=255 {
+                    let h = [a, b, c, 0xff, 0x00];
+                    assert_eq!(pow_hash_ok(&h), legacy(&[a, b, c]), "mismatch at {a:#x},{b:#x},{c:#x}");
+                }
+            }
         }
     }
 

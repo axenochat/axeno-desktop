@@ -85,6 +85,11 @@ export interface AppSettings {
   // not see the user's IP. GitHub sometimes blocks Tor, in which case updates
   // fail and the user can retry or turn this off.
   updateOverTor: boolean;
+  // When on, relay connections are established on randomly staggered delays at
+  // unlock and closed on staggered delays at quit, so a logging relay can't
+  // group your per-contact mailboxes by a synchronized burst of connects/closes.
+  // Costs a brief delay opening and closing the app. Opt-out (defaults on).
+  staggerConnections: boolean;
 }
 
 export const defaultSettings: AppSettings = {
@@ -100,6 +105,7 @@ export const defaultSettings: AppSettings = {
   messageTextSize: "medium",
   autoUpdateCheck: true,
   updateOverTor: true,
+  staggerConnections: true,
 };
 
 export interface BackendContact {
