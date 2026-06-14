@@ -20,6 +20,12 @@ import "./components/Onboarding/Onboarding.css";
 
 interface UnlockResponse { fingerprint: string; display_name: string; }
 type TorStatus = "connecting" | "connected" | "failed";
+
+// Upper bound of the backend's staggered-connect window. MUST mirror
+// CONNECT_JITTER_MAX_MS in src-tauri/src/messaging.rs (20_000 ms): the backend
+// spreads each route's connection across a random delay in [0, this], so the
+// startup indicator counts down from here.
+const CONNECT_STAGGER_MAX_SECS = 20;
 interface TorStatusEvent { status: TorStatus; reason?: string; }
 interface IncomingMessageEvent { contact_id: string; message: BackendMessage; }
 interface BlockContactResponse { active_code_count: number; active_code_ids: string[]; }
@@ -94,6 +100,12 @@ export default function App() {
   const [shuttingDown, setShuttingDown] = useState(false);
   const [shutdownProgress, setShutdownProgress] = useState<{ closed: number; total: number }>({ closed: 0, total: 0 });
   const shuttingDownRef = useRef(false);
+  // Startup counterpart to the shutdown overlay: while the backend staggers each
+  // route's connection across the jitter window, show a non-blocking banner that
+  // counts the window down so the wait is visible instead of looking stalled.
+  // `null` = hidden. Non-blocking (banner, not overlay) so history stays usable.
+  const [connectCountdown, setConnectCountdown] = useState<number | null>(null);
+  const connectCountdownTimerRef = useRef<number | null>(null);
   // Mirror of settings.staggerConnections for the close-intercept handler (whose
   // effect captures props once) and to push the preference to the backend.
   const staggerRef = useRef(true);
@@ -150,6 +162,30 @@ export default function App() {
     setSyncing(value);
   }, []);
 
+  // Show the staggered-connect countdown. No-op when staggering is off (the
+  // backend connects immediately then) so the banner mirrors the close overlay,
+  // which is also skipped when the feature is disabled.
+  const startConnectStaggerIndicator = useCallback(() => {
+    if (!staggerRef.current) return;
+    if (connectCountdownTimerRef.current !== null) {
+      window.clearInterval(connectCountdownTimerRef.current);
+      connectCountdownTimerRef.current = null;
+    }
+    setConnectCountdown(CONNECT_STAGGER_MAX_SECS);
+    connectCountdownTimerRef.current = window.setInterval(() => {
+      setConnectCountdown(prev => {
+        if (prev === null || prev <= 1) {
+          if (connectCountdownTimerRef.current !== null) {
+            window.clearInterval(connectCountdownTimerRef.current);
+            connectCountdownTimerRef.current = null;
+          }
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, []);
+
   const loadMessaging = useCallback(async () => {
     const snap = await invoke<MessagingSnapshot>("messaging_snapshot");
     const nextContacts = snap.contacts.map(contactFromBackend);
@@ -159,7 +195,10 @@ export default function App() {
     // connect_all triggers the relay's queued-message replay; the backend emits
     // axeno-sync-status while that backlog is in flight.
     invoke("messaging_connect_all").catch(() => {});
-  }, []);
+    // Mirror the staggered close: surface the matching connect-side jitter window
+    // as a countdown. Only when there are routes to connect (contacts exist).
+    if (nextContacts.length > 0) startConnectStaggerIndicator();
+  }, [startConnectStaggerIndicator]);
 
   const loadPrivateServerSettings = useCallback(async () => {
     const persisted = await invoke<BackendPrivateServerSettings>("messaging_load_private_server_settings");
@@ -353,6 +392,10 @@ export default function App() {
       unlistenMessage.then(f => f());
       Object.values(reconnectTimersRef.current).forEach(timer => window.clearTimeout(timer));
       reconnectTimersRef.current = {};
+      if (connectCountdownTimerRef.current !== null) {
+        window.clearInterval(connectCountdownTimerRef.current);
+        connectCountdownTimerRef.current = null;
+      }
     };
   }, [loadMessaging, loadPrivateServerSettings, markContactRead, applySyncStatus]);
 
@@ -374,7 +417,15 @@ export default function App() {
       try {
         await invoke("transport_disconnect_all_staggered");
       } catch { /* best effort — close regardless */ }
-      await win.destroy();
+      // Actually close. destroy() can reject (e.g. if the ACL ever lacks the
+      // permission); never let that leave the window stuck open behind the
+      // overlay. Fall back to close(), which re-fires this handler — the guard
+      // above then lets it through without re-staggering.
+      try {
+        await win.destroy();
+      } catch {
+        try { await win.close(); } catch { /* nothing more we can do */ }
+      }
     });
     return () => {
       unlistenProgress.then(f => f());
@@ -595,7 +646,7 @@ export default function App() {
         <div className="shutdown-overlay">
           <div className="onboarding-spinner app-loading-spinner" />
           <p className="shutdown-title">Randomising connection closes…</p>
-          <p className="shutdown-subtitle">Staggering relay disconnects so your mailboxes can’t be linked.</p>
+          <p className="shutdown-subtitle">Staggering relay disconnects to make your mailboxes harder to correlate.</p>
           <div className="shutdown-bar"><div className="shutdown-bar-fill" style={{ width: `${pct}%` }} /></div>
           {total > 0 && <p className="shutdown-count">{closed} / {total}</p>}
         </div>
@@ -627,7 +678,7 @@ export default function App() {
   return (
     <div className="app-root">
       <UpdatePrompt enabled={settings.autoUpdateCheck} updateOverTor={settings.updateOverTor} />
-      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} />
+      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
 
       {active ? (
         <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />

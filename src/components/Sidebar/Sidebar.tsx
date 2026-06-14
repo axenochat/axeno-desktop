@@ -17,6 +17,8 @@ interface Props {
   myDisplayName: string;
   torStatus: "connecting" | "connected" | "failed"; // NEW
   syncing: boolean;
+  /// Seconds left in the staggered-connect window, or null when not staggering.
+  connectCountdown: number | null;
 }
 
 interface ContextMenuState {
@@ -31,7 +33,7 @@ const MENU_HEIGHT = 132;
 export default function Sidebar({
   contacts, allMessages, activeContactId, onSelectContact, onDeleteContact, onBlockContact,
   onOpenAddContact, onOpenSettings,
-  myInitials, myDisplayName, torStatus, syncing
+  myInitials, myDisplayName, torStatus, syncing, connectCountdown
 }: Props) {
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
@@ -97,12 +99,21 @@ export default function Sidebar({
         <input type="text" placeholder="Search" className="sidebar-search-input" value={query} onChange={e => setQuery(e.target.value)} />
       </div>
 
-      {syncing && (
+      {/* Connect-stagger countdown takes visual priority over syncing: routes
+          connect (and so begin syncing) at staggered times, so the two phases
+          overlap — showing the countdown first, then syncing, keeps them from
+          fighting for the same slot. */}
+      {connectCountdown !== null ? (
+        <div className="sidebar-sync" role="status" aria-live="polite">
+          <span className="sidebar-sync-spinner" />
+          <span className="sidebar-sync-text">Connecting to relays… {connectCountdown}s</span>
+        </div>
+      ) : syncing ? (
         <div className="sidebar-sync" role="status" aria-live="polite">
           <span className="sidebar-sync-spinner" />
           <span className="sidebar-sync-text">Syncing messages…</span>
         </div>
-      )}
+      ) : null}
 
       <div className="sidebar-list">
         {visibleContacts.map((c) => {
