@@ -21,11 +21,6 @@ import "./components/Onboarding/Onboarding.css";
 interface UnlockResponse { fingerprint: string; display_name: string; }
 type TorStatus = "connecting" | "connected" | "failed";
 
-// Upper bound of the backend's staggered-connect window. MUST mirror
-// CONNECT_JITTER_MAX_MS in src-tauri/src/messaging.rs (20_000 ms): the backend
-// spreads each route's connection across a random delay in [0, this], so the
-// startup indicator counts down from here.
-const CONNECT_STAGGER_MAX_SECS = 20;
 interface TorStatusEvent { status: TorStatus; reason?: string; }
 interface IncomingMessageEvent { contact_id: string; message: BackendMessage; }
 interface BlockContactResponse { active_code_count: number; active_code_ids: string[]; }
@@ -162,16 +157,17 @@ export default function App() {
     setSyncing(value);
   }, []);
 
-  // Show the staggered-connect countdown. No-op when staggering is off (the
-  // backend connects immediately then) so the banner mirrors the close overlay,
-  // which is also skipped when the feature is disabled.
-  const startConnectStaggerIndicator = useCallback(() => {
-    if (!staggerRef.current) return;
+  // Show the staggered-connect countdown using the actual max jitter for this
+  // run (returned by messaging_connect_all). A zero maxMs means staggering is
+  // off or there are no routes, so no banner is shown.
+  const startConnectStaggerIndicator = useCallback((maxMs: number) => {
+    if (maxMs <= 0) return;
     if (connectCountdownTimerRef.current !== null) {
       window.clearInterval(connectCountdownTimerRef.current);
       connectCountdownTimerRef.current = null;
     }
-    setConnectCountdown(CONNECT_STAGGER_MAX_SECS);
+    const maxSecs = Math.ceil(maxMs / 1000);
+    setConnectCountdown(maxSecs);
     connectCountdownTimerRef.current = window.setInterval(() => {
       setConnectCountdown(prev => {
         if (prev === null || prev <= 1) {
@@ -193,11 +189,10 @@ export default function App() {
     setMessages(groupMessages(snap));
     setActiveContactId(prev => prev || nextContacts[0]?.id || "");
     // connect_all triggers the relay's queued-message replay; the backend emits
-    // axeno-sync-status while that backlog is in flight.
-    invoke("messaging_connect_all").catch(() => {});
-    // Mirror the staggered close: surface the matching connect-side jitter window
-    // as a countdown. Only when there are routes to connect (contacts exist).
-    if (nextContacts.length > 0) startConnectStaggerIndicator();
+    // axeno-sync-status while that backlog is in flight. It returns the actual
+    // max jitter ms chosen for this run so the countdown shows the real window.
+    const maxJitterMs = await invoke<number>("messaging_connect_all").catch(() => 0);
+    if (nextContacts.length > 0) startConnectStaggerIndicator(maxJitterMs);
   }, [startConnectStaggerIndicator]);
 
   const loadPrivateServerSettings = useCallback(async () => {
@@ -640,11 +635,18 @@ export default function App() {
 
   if (shuttingDown) {
     const { closed, total } = shutdownProgress;
-    const pct = total > 0 ? Math.round((closed / total) * 100) : 100;
+    const pct = total > 0 ? Math.round((closed / total) * 100) : 0;
+    const r = 18, circ = 2 * Math.PI * r;
     return (
       <div className="app-root app-centered">
         <div className="shutdown-overlay">
-          <div className="onboarding-spinner app-loading-spinner" />
+          <svg width="44" height="44" viewBox="0 0 44 44">
+            <circle cx="22" cy="22" r={r} fill="none" stroke="var(--border-default)" strokeWidth="3" />
+            <circle cx="22" cy="22" r={r} fill="none" stroke="var(--accent)" strokeWidth="3"
+              strokeDasharray={circ} strokeDashoffset={circ - (pct / 100) * circ}
+              strokeLinecap="round"
+              style={{ transform: "rotate(-90deg)", transformOrigin: "22px 22px", transition: "stroke-dashoffset 0.3s ease" }} />
+          </svg>
           <p className="shutdown-title">Randomising connection closes…</p>
           <p className="shutdown-subtitle">Staggering relay disconnects to make your mailboxes harder to correlate.</p>
           <div className="shutdown-bar"><div className="shutdown-bar-fill" style={{ width: `${pct}%` }} /></div>

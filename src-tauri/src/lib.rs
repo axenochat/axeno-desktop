@@ -726,7 +726,7 @@ async fn messaging_connect_all(
     session: State<'_, AppSessionState>,
     transport_state: State<'_, transport::TransportState>,
     tor_state: State<'_, AppTorState>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     messaging::connect_all(app, &session, transport_state.inner(), tor_state.client.clone()).await
 }
 

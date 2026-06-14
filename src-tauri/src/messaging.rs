@@ -2444,7 +2444,7 @@ pub async fn snapshot(app: AppHandle, session: &AppSessionState, runtime: &Messa
     Ok(MessagingSnapshot { my_recipient_id, my_recipient_ids, contacts: visible_contacts, messages: grouped })
 }
 
-pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_state: &transport::TransportState, tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>) -> Result<(), String> {
+pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_state: &transport::TransportState, tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>) -> Result<u64, String> {
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let (routes, retire_routes, route_sync_contacts) = {
         let _store_guard = session.messaging_store_lock.lock().await;
@@ -2505,14 +2505,24 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
     // not blocked for its full duration — per-route status still arrives via the
     // transport's status events, and offline backlog is replayed once each route
     // connects.
-    for route in routes {
+    //
+    // Pre-compute all delays so we can return the actual max to the frontend for
+    // an accurate countdown (rather than always showing the theoretical max).
+    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() {
+        routes.iter().map(|_| jittered_connect_delay()).collect()
+    } else {
+        routes.iter().map(|_| std::time::Duration::ZERO).collect()
+    };
+    let max_jitter_ms: u64 = delays.iter().map(|d| d.as_millis() as u64).max().unwrap_or(0);
+
+    for (route, delay) in routes.into_iter().zip(delays) {
         let app_clone = app.clone();
         let transport_state_clone = transport_state.clone();
         let tor_client_clone = tor_client.clone();
 
         tokio::spawn(async move {
-            if stagger_connections_enabled() {
-                tokio::time::sleep(jittered_connect_delay()).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             let connection_id = route_connection_id(&route);
             let _ = transport::connect_server(
@@ -2550,7 +2560,7 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
             ));
         });
     }
-    Ok(())
+    Ok(max_jitter_ms)
 }
 
 async fn send_signal_payload_internal(

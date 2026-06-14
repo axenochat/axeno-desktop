@@ -539,7 +539,7 @@ function PrivacySection({ settings, onChange }: { settings: AppSettings; onChang
   return (
     <Section
       title="Privacy"
-      description="Hardening against a relay that logs connection metadata. Your IP is never exposed regardless (relays are Tor hidden services)."
+      description="These settings can help you reduce the chance of being fingerprinted by your connection patterns. They are opt-out because they can be a little annoying, but we recommend you keep then on."
     >
       <Row
         label="Stagger connection timing"

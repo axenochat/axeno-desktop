@@ -13,8 +13,8 @@
 }
 
 .app-loading-spinner {
-  border-color: var(--border);
-  border-top-color: var(--brand);
+  border-color: var(--border-default);
+  border-top-color: var(--accent);
 }
 
 .login-form {
