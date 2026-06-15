@@ -31,8 +31,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CLIENT_A="$SCRIPT_DIR"
-CLIENT_B="$REPO_ROOT/axeno-desktop2"
+CLIENT_A="$REPO_ROOT"
+CLIENT_B="$(dirname "$REPO_ROOT")/axeno-desktop2"
 
 PORT_A="1420"
 PORT_B="1421"
