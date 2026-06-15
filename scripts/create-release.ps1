@@ -95,15 +95,17 @@ Write-Host "==> package.json + package-lock.json"
 npm version $Version --no-git-tag-version --allow-same-version | Out-Null
 
 Write-Host "==> src-tauri/tauri.conf.json"
-$tauriTmp = [System.IO.Path]::GetTempFileName() + '.js'
-Set-Content $tauriTmp -Encoding UTF8 -Value @"
-const fs = require('fs');
-const p = 'src-tauri/tauri.conf.json';
-const c = JSON.parse(fs.readFileSync(p, 'utf8'));
-c.version = process.argv[1];
-fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
-"@
-try { node $tauriTmp $Version } finally { Remove-Item $tauriTmp -ErrorAction SilentlyContinue }
+# Use node (not ConvertTo-Json) to preserve key order and formatting, mirroring
+# the .sh script. With `node -e`, process.argv[1] is the first passed argument.
+$nodeScript = @'
+const fs = require("fs");
+const path = "src-tauri/tauri.conf.json";
+const conf = JSON.parse(fs.readFileSync(path, "utf8"));
+conf.version = process.argv[1];
+fs.writeFileSync(path, JSON.stringify(conf, null, 2) + "\n");
+'@
+node -e $nodeScript $Version
+if ($LASTEXITCODE -ne 0) { Fail "node failed to update src-tauri/tauri.conf.json" }
 
 Write-Host "==> src-tauri/Cargo.toml + Cargo.lock"
 $cargoContent = Get-Content -LiteralPath src-tauri\Cargo.toml -Raw
