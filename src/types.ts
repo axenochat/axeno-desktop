@@ -96,6 +96,12 @@ export interface AppSettings {
   // Maximum random delay window (seconds) for staggering relay disconnects at
   // shutdown. Each socket picks independently in [0, this]. 1–60s, default 6s.
   shutdownJitterMaxSecs: number;
+  // Auto-lock the app (drop the decrypted vault from memory and return to the
+  // unlock screen) after this many minutes with no user activity. 0 = never.
+  autoLockMinutes: number;
+  // When on, the app locks as soon as its window loses focus / is hidden.
+  // Opt-in, since it re-prompts for the passphrase on every app switch.
+  lockOnHide: boolean;
 }
 
 export const defaultSettings: AppSettings = {
@@ -114,6 +120,8 @@ export const defaultSettings: AppSettings = {
   staggerConnections: true,
   connectJitterMaxSecs: 20,
   shutdownJitterMaxSecs: 6,
+  autoLockMinutes: 15,
+  lockOnHide: false,
 };
 
 export interface BackendContact {

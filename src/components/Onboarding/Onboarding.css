@@ -469,3 +469,27 @@
   width: 15px;
   height: 15px;
 }
+
+/* "No recovery" warning shown when setting/changing the vault password. */
+.onboarding-recovery-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  text-align: left;
+  margin: 14px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid rgba(229, 72, 77, 0.35);
+  background: rgba(229, 72, 77, 0.08);
+  border-radius: 10px;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.onboarding-recovery-warning svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  color: #e5484d;
+}

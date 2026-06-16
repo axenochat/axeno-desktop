@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Contact, Message } from "../../types";
 import { contactDisplayName, contactInitials, formatMessageTime, lastMessage, messagePreview, unreadCount } from "../../utils";
-import { IconSearch, IconPlus, IconSettings } from "../icons";
+import { IconSearch, IconPlus, IconSettings, IconLock } from "../icons";
 import "./Sidebar.css";
 
 interface Props {
@@ -13,6 +13,7 @@ interface Props {
   onBlockContact: (contactId: string) => void | Promise<void>;
   onOpenAddContact: () => void;
   onOpenSettings: () => void;
+  onLock: () => void;
   myInitials: string;
   myDisplayName: string;
   torStatus: "connecting" | "connected" | "failed"; // NEW
@@ -32,7 +33,7 @@ const MENU_HEIGHT = 132;
 
 export default function Sidebar({
   contacts, allMessages, activeContactId, onSelectContact, onDeleteContact, onBlockContact,
-  onOpenAddContact, onOpenSettings,
+  onOpenAddContact, onOpenSettings, onLock,
   myInitials, myDisplayName, torStatus, syncing, connectCountdown
 }: Props) {
   const [query, setQuery] = useState("");
@@ -152,6 +153,9 @@ export default function Sidebar({
         <span className="me-name">{myDisplayName}</span>
         <button className="icon-button" onClick={onOpenAddContact} aria-label="Add contact">
           <IconPlus />
+        </button>
+        <button className="icon-button" onClick={onLock} aria-label="Lock app" title="Lock app">
+          <IconLock />
         </button>
         <button className="icon-button" onClick={onOpenSettings} aria-label="Settings">
           <IconSettings />

@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { AppSettings, InviteCode, PrivateServer, ServerChoice } from "../../types";
 import {
   IconArrowLeft, IconKey, IconServer, IconEye, IconShield,
-  IconInfo, IconCopy, IconPlus, IconTrash, IconCheck, IconChevronDown, IconEdit,
+  IconInfo, IconCopy, IconPlus, IconTrash, IconCheck, IconChevronDown, IconEdit, IconLock,
 } from "../icons";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import PasswordStrengthMeter from "../PasswordStrengthMeter/PasswordStrengthMeter";
+import { evaluatePassword, checkPasswordAcceptable, PasswordStrength } from "../../passwordStrength";
 import "./Settings.css";
 
-type Section = "identity" | "servers" | "appearance" | "privacy" | "about";
+type Section = "identity" | "servers" | "appearance" | "privacy" | "security" | "about";
 
 interface Props {
   settings: AppSettings;
@@ -38,6 +40,7 @@ export default function Settings({
           <NavItem icon={<IconServer />} label="Servers" active={section === "servers"} onClick={() => setSection("servers")} />
           <NavItem icon={<IconEye />} label="Appearance" active={section === "appearance"} onClick={() => setSection("appearance")} />
           <NavItem icon={<IconShield />} label="Privacy" active={section === "privacy"} onClick={() => setSection("privacy")} />
+          <NavItem icon={<IconLock />} label="Security" active={section === "security"} onClick={() => setSection("security")} />
           <NavItem icon={<IconInfo />} label="About" active={section === "about"} onClick={() => setSection("about")} />
         </nav>
 
@@ -46,6 +49,7 @@ export default function Settings({
           {section === "servers" && <ServersSection settings={settings} onChange={onChange} />}
           {section === "appearance" && <AppearanceSection settings={settings} onChange={onChange} />}
           {section === "privacy" && <PrivacySection settings={settings} onChange={onChange} />}
+          {section === "security" && <SecuritySection settings={settings} onChange={onChange} />}
           {section === "about" && <AboutSection settings={settings} onChange={onChange} />}
         </main>
       </div>
@@ -171,7 +175,27 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
   const [pwReady, setPwReady] = useState(false);
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
+  const [pwStrength, setPwStrength] = useState<PasswordStrength | null>(null);
+  const [pwLength, setPwLength] = useState(0);
   const [reusableCode, setReusableCode] = useState(false);
+
+  const refreshPwStrength = () => {
+    const pw = newPwRef.current?.value ?? "";
+    const confirm = confirmPwRef.current?.value ?? "";
+    setPwLength(pw.length);
+    setPwStrength(pw ? evaluatePassword(pw, [displayName]) : null);
+    setPwReady(pw.length > 0 && confirm.length > 0);
+    setPwError("");
+  };
+
+  const resetPwModal = () => {
+    if (newPwRef.current) newPwRef.current.value = "";
+    if (confirmPwRef.current) confirmPwRef.current.value = "";
+    setPwReady(false);
+    setPwStrength(null);
+    setPwLength(0);
+    setPwError("");
+  };
 
   const saveName = async () => {
     const trimmed = draft.trim();
@@ -233,22 +257,19 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
   const submitNewPassword = async () => {
     const newPw = newPwRef.current?.value ?? "";
     const confirmPw = confirmPwRef.current?.value ?? "";
-    if (newPw.length < 12) { setPwError("Password must be at least 12 characters. A 4-5 word passphrase is better."); return; }
+    const acceptable = checkPasswordAcceptable(newPw, [displayName]);
+    if (!acceptable.ok) { setPwError(acceptable.reason); return; }
     if (newPw !== confirmPw) { setPwError("Passwords do not match."); return; }
     setPwError("");
     setPwBusy(true);
     try {
       await invoke("change_password", { newPassphrase: newPw });
       setShowPwModal(false);
-      if (newPwRef.current) newPwRef.current.value = "";
-      if (confirmPwRef.current) confirmPwRef.current.value = "";
-      setPwReady(false);
+      resetPwModal();
     } catch (e) {
       setPwError(typeof e === "string" ? e : "Failed to change password.");
     } finally {
-      if (newPwRef.current) newPwRef.current.value = "";
-      if (confirmPwRef.current) confirmPwRef.current.value = "";
-      setPwReady(false);
+      resetPwModal();
       setPwBusy(false);
     }
   };
@@ -368,7 +389,7 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
       />
 
       {showPwModal && (
-        <div className="settings-modal-backdrop" onClick={() => { if (!pwBusy) { if (newPwRef.current) newPwRef.current.value = ""; if (confirmPwRef.current) confirmPwRef.current.value = ""; setPwReady(false); setShowPwModal(false); } }}>
+        <div className="settings-modal-backdrop" onClick={() => { if (!pwBusy) { resetPwModal(); setShowPwModal(false); } }}>
           <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
             <h3 className="settings-modal-title">Change password</h3>
             <p className="settings-modal-desc">
@@ -380,22 +401,30 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
               className="text-input"
               placeholder="New password"
               ref={newPwRef}
-              onChange={(e) => { setPwReady(e.currentTarget.value.length > 0 && (confirmPwRef.current?.value.length ?? 0) > 0); setPwError(""); }}
+              onChange={refreshPwStrength}
               autoFocus
             />
+            <PasswordStrengthMeter strength={pwStrength} length={pwLength} />
             <input
               type="password"
               className="text-input"
               placeholder="Confirm new password"
               ref={confirmPwRef}
-              onChange={(e) => { setPwReady(e.currentTarget.value.length > 0 && (newPwRef.current?.value.length ?? 0) > 0); setPwError(""); }}
+              onChange={refreshPwStrength}
             />
+            <div className="onboarding-recovery-warning">
+              <IconLock />
+              <span>
+                There is no password reset. If you forget the new password, your identity
+                and message history cannot be recovered by anyone.
+              </span>
+            </div>
             {pwError && <div className="onboarding-error">{pwError}</div>}
             <div className="button-row">
               <button className="btn btn-primary" onClick={submitNewPassword} disabled={pwBusy || !pwReady}>
                 {pwBusy ? "Saving…" : "Save"}
               </button>
-              <button className="btn btn-secondary" onClick={() => { if (newPwRef.current) newPwRef.current.value = ""; if (confirmPwRef.current) confirmPwRef.current.value = ""; setPwReady(false); setShowPwModal(false); }} disabled={pwBusy}>Cancel</button>
+              <button className="btn btn-secondary" onClick={() => { resetPwModal(); setShowPwModal(false); }} disabled={pwBusy}>Cancel</button>
             </div>
           </div>
         </div>
@@ -595,6 +624,39 @@ function PrivacySection({ settings, onChange }: { settings: AppSettings; onChang
   );
 }
 
+
+function SecuritySection({ settings, onChange }: { settings: AppSettings; onChange: (s: AppSettings) => void }) {
+  return (
+    <Section
+      title="Security"
+      description="Locking clears your decrypted identity and message history from memory and returns to the unlock screen. Your passphrase is required to unlock again."
+    >
+      <Row
+        label="Auto-lock when idle"
+        description="Lock automatically after a period with no activity. Use the Lock button in the sidebar to lock immediately."
+        control={
+          <Select
+            value={String(settings.autoLockMinutes)}
+            options={[
+              { value: "0", label: "Never" },
+              { value: "1", label: "1 minute" },
+              { value: "5", label: "5 minutes" },
+              { value: "15", label: "15 minutes" },
+              { value: "30", label: "30 minutes" },
+              { value: "60", label: "1 hour" },
+            ]}
+            onChange={(v) => onChange({ ...settings, autoLockMinutes: Number(v) })}
+          />
+        }
+      />
+      <Row
+        label="Lock when window loses focus"
+        description="Locks immediately whenever you switch away from Axeno. Strongest, but re-prompts for your passphrase every time you return."
+        control={<Toggle on={settings.lockOnHide} onChange={(v) => onChange({ ...settings, lockOnHide: v })} />}
+      />
+    </Section>
+  );
+}
 
 function AboutSection({ settings, onChange }: { settings: AppSettings; onChange: (s: AppSettings) => void }) {
   // Show the real app version (from tauri.conf.json) so it can never drift from

@@ -95,6 +95,12 @@ export default function App() {
   const [shuttingDown, setShuttingDown] = useState(false);
   const [shutdownProgress, setShutdownProgress] = useState<{ closed: number; total: number }>({ closed: 0, total: 0 });
   const shuttingDownRef = useRef(false);
+  // True while the app is locked (or being locked). Gates the auto-reconnect and
+  // tor-connected handlers so they don't reopen relay sockets behind the lock
+  // screen, and prevents a second lock while one is in progress.
+  const lockedRef = useRef(false);
+  // Timestamp of the last user activity, used by the idle auto-lock poller.
+  const lastActivityRef = useRef(Date.now());
   // Startup counterpart to the shutdown overlay: while the backend staggers each
   // route's connection across the jitter window, show a non-blocking banner that
   // counts the window down so the wait is visible instead of looking stalled.
@@ -251,7 +257,82 @@ export default function App() {
     setContacts(prev => prev.map(c => c.id === contactId ? next : c));
   }, []);
 
+  // Lock the app: drop the decrypted vault + message-store key from Rust memory,
+  // tear down relay sockets (staggered, in the background, so a logging relay
+  // can't see them all drop at once), wipe in-memory UI state, and return to the
+  // unlock screen. Idempotent and guarded so concurrent triggers (button + idle
+  // + blur) collapse into one.
+  const lockApp = useCallback(async () => {
+    if (lockedRef.current) return;
+    lockedRef.current = true;
+    setShowSettings(false);
+    setShowAddContact(false);
+    setShowChatSettings(false);
+    setShowVerify(false);
+    setCodeWarning(null);
+    // Best-effort socket teardown; never block the lock on it.
+    invoke("transport_disconnect_all_staggered").catch(() => {});
+    try { await invoke("lock_identity"); } catch { /* lock the UI regardless */ }
+    setContacts([]);
+    setMessages({});
+    setFileProgress({});
+    setActiveContactId("");
+    activeContactIdRef.current = "";
+    setDisplayName("");
+    setServerSettingsLoaded(false);
+    setSyncing(false);
+    setConnectCountdown(null);
+    setLoginError("");
+    setAppState("login");
+  }, []);
+
   useEffect(() => () => { if (syncCapTimerRef.current) window.clearTimeout(syncCapTimerRef.current); }, []);
+
+  // Auto-lock on inactivity and (optionally) on window blur/hide. Only armed
+  // while unlocked and in the chat view.
+  //
+  // Activity is recorded as a timestamp (`lastActivityRef`); a separate interval
+  // checks how long it has been since the last activity and locks once the
+  // configured window has elapsed. This is deliberately NOT a single
+  // reset-on-activity setTimeout: stray pointer events (the per-second connect
+  // countdown or the auto-scrolling message list repainting under a stationary
+  // cursor can emit them) would keep clearing/recreating that timeout so it never
+  // fires. Stamping a timestamp + polling is immune to that and to effect churn.
+  useEffect(() => {
+    if (appState !== "chat") return;
+    const { autoLockMinutes, lockOnHide } = settings;
+    if (autoLockMinutes <= 0 && !lockOnHide) return;
+
+    let intervalId: number | null = null;
+    const markActivity = () => { lastActivityRef.current = Date.now(); };
+    const activityEvents: (keyof WindowEventMap)[] = ["mousedown", "keydown", "wheel", "touchstart", "mousemove"];
+
+    if (autoLockMinutes > 0) {
+      const timeoutMs = autoLockMinutes * 60_000;
+      lastActivityRef.current = Date.now();
+      activityEvents.forEach((ev) => window.addEventListener(ev, markActivity, { passive: true }));
+      // Check several times within the window (capped) so the lock is reasonably
+      // prompt without polling needlessly often.
+      const checkMs = Math.min(Math.max(Math.floor(timeoutMs / 6), 1_000), 15_000);
+      intervalId = window.setInterval(() => {
+        if (Date.now() - lastActivityRef.current >= timeoutMs) void lockApp();
+      }, checkMs);
+    }
+
+    const onVisibility = () => { if (document.visibilityState === "hidden") void lockApp(); };
+    const onBlur = () => { void lockApp(); };
+    if (lockOnHide) {
+      document.addEventListener("visibilitychange", onVisibility);
+      window.addEventListener("blur", onBlur);
+    }
+
+    return () => {
+      if (intervalId !== null) window.clearInterval(intervalId);
+      activityEvents.forEach((ev) => window.removeEventListener(ev, markActivity));
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [appState, settings.autoLockMinutes, settings.lockOnHide, lockApp]);
 
   const activeContactIdForUi = activeContactId || contacts[0]?.id || "";
 
@@ -282,7 +363,7 @@ export default function App() {
     const unlistenTor = listen<TorStatusEvent>("tor-status", (event) => {
       setTorStatus(event.payload.status);
       setTorError(event.payload.reason ?? "");
-      if (event.payload.status === "connected") {
+      if (event.payload.status === "connected" && !lockedRef.current) {
         invoke("messaging_connect_all").catch(() => {});
       }
     });
@@ -292,9 +373,10 @@ export default function App() {
     });
 
     const unlistenServerStatus = listen<ServerStatusEvent>("axeno-server-status", (event) => {
-      // While quitting, the staggered teardown intentionally disconnects every
-      // socket; don't schedule auto-reconnects that would race the shutdown.
-      if (shuttingDownRef.current) return;
+      // While quitting or locked, sockets are intentionally torn down; don't
+      // schedule auto-reconnects that would race the shutdown or reopen them
+      // behind the lock screen.
+      if (shuttingDownRef.current || lockedRef.current) return;
       const { server_id: serverId, status } = event.payload;
       if (status === "ready" || status === "connected" || status === "connecting") {
         const existing = reconnectTimersRef.current[serverId];
@@ -469,6 +551,8 @@ export default function App() {
       const res = await invoke<UnlockResponse>("unlock_identity", { passphrase });
       if (loginPasswordRef.current) loginPasswordRef.current.value = "";
       setLoginPasswordReady(false);
+      // Re-arm the session: clears the lock guard so reconnects resume.
+      lockedRef.current = false;
       setDisplayName(res.display_name);
       await loadMessaging();
       await loadPrivateServerSettings().catch(() => setServerSettingsLoaded(true));
@@ -714,7 +798,7 @@ export default function App() {
   return (
     <div className="app-root">
       <UpdatePrompt enabled={settings.autoUpdateCheck} updateOverTor={settings.updateOverTor} />
-      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
+      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} onLock={() => { void lockApp(); }} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
 
       {active ? (
         <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />

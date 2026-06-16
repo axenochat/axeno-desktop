@@ -185,6 +185,21 @@ const FILE_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
 /// AEAD tag length added to every encrypted chunk (ChaCha20-Poly1305).
 const FILE_CHUNK_TAG_BYTES: u64 = 16;
 
+/// Validate a peer-supplied file pointer's self-declared shape: non-empty, with a
+/// sane chunk size and a chunk count that exactly matches `ceil(size / chunk_size)`.
+///
+/// We deliberately do NOT impose a client-side maximum size. The blob lives on the
+/// *sender's* relay, whose operator sets the size cap (and enforces it at upload),
+/// so an arbitrary number baked into the client would only block transfers that the
+/// relay operators actually allow. The recipient sees the declared size in the UI
+/// and chooses whether to download. What this guards against is malformed/abusive
+/// metadata: a chunk count that disagrees with the size (which could otherwise spin
+/// the download loop or let a sender misrepresent the transfer).
+fn file_pointer_shape_ok(size: u64, chunk_size: u32, total_chunks: u32) -> bool {
+    if size == 0 || chunk_size == 0 || total_chunks == 0 { return false; }
+    size.div_ceil(chunk_size as u64) == total_chunks as u64
+}
+
 /// The wire pointer for a "file" payload: everything the recipient needs to
 /// fetch and decrypt the blob, carried inside the E2E-encrypted Signal body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,7 +650,7 @@ fn decode_signal_plaintext(raw: Vec<u8>) -> Result<DecryptedSignalText, String> 
             message_id: payload.message_id,
             sent_at_ms: payload.sent_at_ms,
             body: payload.body,
-            sender_display_name: payload.sender_display_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            sender_display_name: payload.sender_display_name.map(|s| clamp_display_name(&s)).filter(|s| !s.is_empty()),
             sender_mailbox_id: payload.sender_mailbox_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             sender_delivery_token: payload.sender_delivery_token.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             sender_delivery_token_epoch: payload.sender_delivery_token_epoch.filter(|epoch| *epoch > 0),
@@ -1751,6 +1766,15 @@ fn clean_relay_display_name(input: Option<String>) -> Option<String> {
     Some(name.chars().take(80).collect())
 }
 
+/// Upper bound (in characters) on a peer-supplied display name. A connection code
+/// or message can carry an arbitrary name; without a cap a malicious peer/relay
+/// could bloat the encrypted store and the UI with a multi-KB string. Trim, then
+/// clamp by character count (not bytes, so multibyte names aren't split).
+const MAX_DISPLAY_NAME_CHARS: usize = 80;
+fn clamp_display_name(name: &str) -> String {
+    name.trim().chars().take(MAX_DISPLAY_NAME_CHARS).collect()
+}
+
 fn connection_code_response(store: &MessagingStore, pending: &PendingInvite) -> ConnectionCodeResponse {
     let current_name = relay_display_name_for_url(store, &pending.server_url);
     let server_name = if current_name == "Unknown relay" {
@@ -1826,7 +1850,7 @@ fn contact_from_payload(payload: InvitePayload, local_identity_public: &[u8]) ->
     }
     Ok(StoredContact {
         id: payload.mailbox_id.clone(),
-        display_name: Some(payload.display_name.clone()).filter(|s| !s.trim().is_empty()),
+        display_name: Some(clamp_display_name(&payload.display_name)).filter(|s| !s.is_empty()),
         recipient_id: payload.mailbox_id.clone(),
         server_url: server_url.clone(),
         server_id: server_id_for_url(&server_url),
@@ -3104,6 +3128,13 @@ pub async fn download_file(
         (att, msg.contact_id.clone())
     };
 
+    // Re-validate the stored pointer before writing anything: an attachment
+    // persisted by an older build (or a tampered store) with inconsistent
+    // chunk/size metadata must not be able to drive a malformed download.
+    if !file_pointer_shape_ok(attachment.size, attachment.chunk_size, attachment.total_chunks) {
+        return Err("this file's metadata is invalid".into());
+    }
+
     let cipher = file_cipher(&attachment.key_b64)?;
     let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "downloading", None).await?;
 
@@ -3381,7 +3412,7 @@ pub async fn handle_incoming_envelope(
         // (we deliberately do not auto-fetch the blob — the recipient decides when
         // to spend the bandwidth). The bubble renders from the attachment.
         match serde_json::from_str::<FilePointer>(&decrypted.message.body) {
-            Ok(p) if p.v == 1 && p.total_chunks > 0 => {
+            Ok(p) if p.v == 1 && file_pointer_shape_ok(p.size, p.chunk_size, p.total_chunks) => {
                 let attachment = FileAttachment {
                     transfer_id: p.transfer_id,
                     key_b64: p.key_b64,
@@ -4490,6 +4521,42 @@ mod signal_protocol_engine {
         Ok(DecryptedEnvelope { contact, message: decoded, consumed_opk_ids })
     }
 
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_is_trimmed_and_capped() {
+        assert_eq!(clamp_display_name("  Alice  "), "Alice");
+        let long = "x".repeat(500);
+        assert_eq!(clamp_display_name(&long).chars().count(), MAX_DISPLAY_NAME_CHARS);
+        // Multibyte names are clamped by character, never split mid-codepoint.
+        let emoji = "🙂".repeat(200);
+        assert_eq!(clamp_display_name(&emoji).chars().count(), MAX_DISPLAY_NAME_CHARS);
+    }
+
+    #[test]
+    fn file_pointer_shape_validation() {
+        let chunk = FILE_CHUNK_PLAINTEXT_BYTES as u32;
+        // A well-formed pointer: chunk count matches ceil(size / chunk_size).
+        assert!(file_pointer_shape_ok(chunk as u64 + 1, chunk, 2));
+        assert!(file_pointer_shape_ok(1, chunk, 1));
+        // Zero / empty is rejected.
+        assert!(!file_pointer_shape_ok(0, chunk, 0));
+        assert!(!file_pointer_shape_ok(100, 0, 1));
+        assert!(!file_pointer_shape_ok(100, chunk, 0));
+        // Chunk count inconsistent with the declared size is rejected (a malicious
+        // sender can't understate or overstate the chunk count to misrepresent the
+        // transfer or spin the download loop).
+        assert!(!file_pointer_shape_ok(chunk as u64 + 1, chunk, 1));
+        assert!(!file_pointer_shape_ok(100, chunk, 5));
+        // A large size is fine as long as it is internally consistent: the relay
+        // operator, not the client, decides the maximum file size.
+        let big = 10 * 1024 * 1024 * 1024u64; // 10 GiB
+        assert!(file_pointer_shape_ok(big, chunk, big.div_ceil(chunk as u64) as u32));
+    }
 }
 
 #[cfg(test)]
