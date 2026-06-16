@@ -31,6 +31,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+OS="$(uname -s)"  # Linux or Darwin (macOS); used to pick paths/terminal/ports
+
 CLIENT_A="$REPO_ROOT"
 CLIENT_B="$(dirname "$REPO_ROOT")/axeno-desktop2"
 
@@ -62,11 +64,18 @@ PY
 )"
 APP_ID_B="${APP_ID_A}2"
 
-# Tauri's app_data_dir on Linux is ~/.local/share/<identifier>; config is
-# ~/.config/<identifier>. The vault, message store, and unified state all live
-# under app_data_dir.
-DATA_A="$HOME/.local/share/$APP_ID_A"; CONF_A="$HOME/.config/$APP_ID_A"
-DATA_B="$HOME/.local/share/$APP_ID_B"; CONF_B="$HOME/.config/$APP_ID_B"
+# Tauri's app data/config dirs differ by platform. On Linux app_data_dir is
+# ~/.local/share/<identifier> and config is ~/.config/<identifier>. On macOS
+# both live under ~/Library/Application Support/<identifier>. The vault, message
+# store, and unified state all live under app_data_dir.
+if [[ "$OS" == "Darwin" ]]; then
+  SUPPORT="$HOME/Library/Application Support"
+  DATA_A="$SUPPORT/$APP_ID_A"; CONF_A="$SUPPORT/$APP_ID_A"
+  DATA_B="$SUPPORT/$APP_ID_B"; CONF_B="$SUPPORT/$APP_ID_B"
+else
+  DATA_A="$HOME/.local/share/$APP_ID_A"; CONF_A="$HOME/.config/$APP_ID_A"
+  DATA_B="$HOME/.local/share/$APP_ID_B"; CONF_B="$HOME/.config/$APP_ID_B"
+fi
 
 if [[ "$RESET" -eq 1 ]]; then
   log "Reset: wiping both clients' app data"
@@ -136,17 +145,35 @@ log "Installing npm dependencies (client A)"
 log "Installing npm dependencies (client B)"
 (cd "$CLIENT_B" && npm install)
 
-if command -v ss >/dev/null 2>&1; then
-  for p in "$PORT_A" "$PORT_B"; do
+for p in "$PORT_A" "$PORT_B"; do
+  if command -v ss >/dev/null 2>&1; then
     if ss -ltn "sport = :$p" 2>/dev/null | grep -q ":$p"; then
       warn "Port $p is already in use. Free it first, e.g.: fuser -k ${p}/tcp"
     fi
-  done
-fi
+  elif command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+      warn "Port $p is already in use. Free it first, e.g.: lsof -ti tcp:$p | xargs kill"
+    fi
+  fi
+done
 
 run_in_terminal() {
   local title="$1" dir="$2" cmd="$3"
   local full_cmd="cd '$dir' && $cmd; echo; echo '[axeno-test] $title exited. Press Enter to close.'; read -r _"
+
+  if [[ "$OS" == "Darwin" ]]; then
+    # macOS: open a new Terminal.app window running the command. The AppleScript
+    # string needs embedded double quotes/backslashes escaped.
+    local osa_cmd=${full_cmd//\\/\\\\}
+    osa_cmd=${osa_cmd//\"/\\\"}
+    osascript >/dev/null 2>&1 <<EOF
+tell application "Terminal"
+    activate
+    do script "$osa_cmd"
+end tell
+EOF
+    return
+  fi
 
   if command -v gnome-terminal >/dev/null 2>&1; then
     gnome-terminal --title="$title" -- bash -lc "$full_cmd"
@@ -166,12 +193,19 @@ run_in_terminal() {
   fi
 }
 
+# WEBKIT_DISABLE_COMPOSITING_MODE is a Linux WebKitGTK workaround; on macOS
+# (WebKit/WKWebView) it is unnecessary, so only prepend it on Linux.
+DEV_CMD="npm run tauri dev"
+if [[ "$OS" != "Darwin" ]]; then
+  DEV_CMD="WEBKIT_DISABLE_COMPOSITING_MODE=1 $DEV_CMD"
+fi
+
 log "Starting client A (Vite port $PORT_A)"
-run_in_terminal "Axeno Client A" "$CLIENT_A" "WEBKIT_DISABLE_COMPOSITING_MODE=1 npm run tauri dev"
+run_in_terminal "Axeno Client A" "$CLIENT_A" "$DEV_CMD"
 sleep 2
 
 log "Starting client B (Vite port $PORT_B)"
-run_in_terminal "Axeno Client B" "$CLIENT_B" "WEBKIT_DISABLE_COMPOSITING_MODE=1 npm run tauri dev"
+run_in_terminal "Axeno Client B" "$CLIENT_B" "$DEV_CMD"
 
 cat <<EOF
 
