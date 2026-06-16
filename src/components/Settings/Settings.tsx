@@ -560,14 +560,14 @@ function PrivacySection({ settings, onChange }: { settings: AppSettings; onChang
     >
       <Row
         label="Stagger connection timing"
-        description="Connect and disconnect each conversation's relay link on random delays, so a logging relay can't group your contacts by them all coming online or going offline at once. Adds a short delay when opening and closing the app."
+        description="Connect and disconnect each conversation on random delays, so a logging relay can't group your contacts by them all coming online or going offline at once. Adds a short delay when opening and closing the app."
         control={<Toggle on={settings.staggerConnections} onChange={(v) => onChange({ ...settings, staggerConnections: v })} />}
       />
       {settings.staggerConnections && (
         <>
           <Row
             label="Connect jitter window"
-            description="Each relay link picks a random delay in [0, this] before connecting at startup. Larger window = stronger privacy, longer wait."
+            description="Each conversation's connection picks a random delay in [0, this] before connecting at startup. Larger window = stronger privacy, longer wait."
             control={
               <JitterSlider
                 value={settings.connectJitterMaxSecs}
@@ -579,7 +579,7 @@ function PrivacySection({ settings, onChange }: { settings: AppSettings; onChang
           />
           <Row
             label="Disconnect jitter window"
-            description="Each relay link picks a random delay in [0, this] before closing at shutdown."
+            description="Each conversation's connection picks a random delay in [0, this] before closing at shutdown."
             control={
               <JitterSlider
                 value={settings.shutdownJitterMaxSecs}

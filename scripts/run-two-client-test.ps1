@@ -183,18 +183,22 @@ function Start-InTerminal {
     param([string]$Title, [string]$Dir, [string]$Command)
 
     # Launch a new console window that cd's into $Dir, runs $Command, then waits
-    # so the window stays open after the dev client exits.
+    # so the window stays open after the dev client exits. The command is passed
+    # as a Base64 -EncodedCommand so semicolons/quotes survive argument parsing.
+    # We launch pwsh/powershell directly (not via `wt`, whose command-line parser
+    # mangles titles with spaces and treats ';' as a tab delimiter); on Windows
+    # 11 the new window is still hosted by Windows Terminal if it's the default.
     $inner = "Set-Location -LiteralPath '$Dir'; `$Host.UI.RawUI.WindowTitle = '$Title'; $Command; Write-Host ''; Read-Host '[axeno-test] $Title exited. Press Enter to close'"
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
 
-    if (Get-Command wt -ErrorAction SilentlyContinue) {
-        # Windows Terminal: open each client in its own tab.
-        Start-Process wt -ArgumentList @('new-tab', '--title', $Title, 'pwsh', '-NoExit', '-Command', $inner)
-    } elseif (Get-Command pwsh -ErrorAction SilentlyContinue) {
-        Start-Process pwsh -ArgumentList @('-NoExit', '-Command', $inner)
+    if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+        Start-Process pwsh -ArgumentList @('-NoExit', '-EncodedCommand', $encoded)
+    } elseif (Get-Command powershell -ErrorAction SilentlyContinue) {
+        Start-Process powershell -ArgumentList @('-NoExit', '-EncodedCommand', $encoded)
     } else {
-        Write-Warn "No pwsh/Windows Terminal found; running '$Title' in the background, logging to $REPO_ROOT\$($Title -replace ' ', '_').log"
+        Write-Warn "No pwsh/powershell found; running '$Title' in the background, logging to $REPO_ROOT\$($Title -replace ' ', '_').log"
         $log = Join-Path $REPO_ROOT ("$($Title -replace ' ', '_').log")
-        Start-Process powershell -ArgumentList @('-Command', $inner) -RedirectStandardOutput $log -RedirectStandardError $log -WindowStyle Hidden
+        Start-Process powershell -ArgumentList @('-EncodedCommand', $encoded) -RedirectStandardOutput $log -RedirectStandardError $log -WindowStyle Hidden
     }
 }
 

@@ -106,7 +106,7 @@ export default function Sidebar({
       {connectCountdown !== null ? (
         <div className="sidebar-sync" role="status" aria-live="polite">
           <span className="sidebar-sync-spinner" />
-          <span className="sidebar-sync-text">Connecting to relays… {connectCountdown}s</span>
+          <span className="sidebar-sync-text">Staggering connections… {connectCountdown}s</span>
         </div>
       ) : syncing ? (
         <div className="sidebar-sync" role="status" aria-live="polite">

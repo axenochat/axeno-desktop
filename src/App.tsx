@@ -189,18 +189,39 @@ export default function App() {
     }, 1000);
   }, []);
 
-  const loadMessaging = useCallback(async () => {
+  // Pull the latest contacts/messages from the backend into the UI. This is a
+  // pure read: it never (re)connects routes or shows the connect-stagger banner,
+  // so it is safe to call on every inbound message and other frequent refreshes.
+  const refreshSnapshot = useCallback(async () => {
     const snap = await invoke<MessagingSnapshot>("messaging_snapshot");
     const nextContacts = snap.contacts.map(contactFromBackend);
     setContacts(nextContacts);
     setMessages(groupMessages(snap));
     setActiveContactId(prev => prev || nextContacts[0]?.id || "");
-    // connect_all triggers the relay's queued-message replay; the backend emits
-    // axeno-sync-status while that backlog is in flight. It returns the actual
-    // max jitter ms chosen for this run so the countdown shows the real window.
+    return nextContacts;
+  }, []);
+
+  // Establish/keep-alive all route connections. connect_all is idempotent —
+  // healthy routes are reused, dead ones rebuilt — and it triggers the relay's
+  // queued-message replay (the backend emits axeno-sync-status while that backlog
+  // is in flight). Crucially it keeps the sender routes warm so replies send
+  // instantly instead of building a Tor circuit on demand.
+  //
+  // `showBanner` controls only the cosmetic stagger countdown. Show it at genuine
+  // (re)connect moments — login, onboarding, add/migrate contact — but NOT on the
+  // keep-alive after an inbound message, which would flash the banner on every
+  // received message. connect_all returns the actual max jitter ms for this run
+  // so the countdown reflects the real window.
+  const connectAll = useCallback(async (showBanner: boolean) => {
     const maxJitterMs = await invoke<number>("messaging_connect_all").catch(() => 0);
-    if (nextContacts.length > 0) startConnectStaggerIndicator(maxJitterMs);
+    if (showBanner) startConnectStaggerIndicator(maxJitterMs);
   }, [startConnectStaggerIndicator]);
+
+  // Initial session load: refresh the snapshot, then connect all routes (banner).
+  const loadMessaging = useCallback(async () => {
+    const nextContacts = await refreshSnapshot();
+    await connectAll(nextContacts.length > 0);
+  }, [refreshSnapshot, connectAll]);
 
   const loadPrivateServerSettings = useCallback(async () => {
     const persisted = await invoke<BackendPrivateServerSettings>("messaging_load_private_server_settings");
@@ -366,9 +387,13 @@ export default function App() {
         setActiveContactId(contactId);
       }
 
+      // Pull the authoritative snapshot, then keep routes warm so a reply sends
+      // instantly. Warm silently — no stagger banner — since this fires on every
+      // received message (showing it here was the spurious-banner bug).
       const refreshAfterRead = async () => {
         if (isOpenChat) await markContactRead(contactId).catch(() => {});
-        await loadMessaging().catch(() => {});
+        await refreshSnapshot().catch(() => {});
+        await connectAll(false).catch(() => {});
       };
       void refreshAfterRead();
     });
@@ -399,7 +424,7 @@ export default function App() {
         connectCountdownTimerRef.current = null;
       }
     };
-  }, [loadMessaging, loadPrivateServerSettings, markContactRead, applySyncStatus]);
+  }, [refreshSnapshot, connectAll, loadPrivateServerSettings, markContactRead, applySyncStatus]);
 
   // Intercept the window close: hold it open, stagger-close the relay sockets so
   // a logging relay can't see all our mailboxes drop in one burst, then destroy
@@ -583,8 +608,10 @@ export default function App() {
     const updated = await invoke<BackendContact>("messaging_migrate_contact_with_code", { contactId, code });
     const next = contactFromBackend(updated);
     setContacts(prev => prev.map(c => c.id === contactId ? next : c));
-    invoke("messaging_connect_all").catch(() => {});
-    await loadMessaging().catch(() => {});
+    // Migrating points this contact at a new relay/route, so connect once (with
+    // the banner) — not via loadMessaging, which would connect a second time.
+    await refreshSnapshot().catch(() => {});
+    await connectAll(true);
   };
 
   const selectContact = async (id: string) => {
@@ -654,8 +681,8 @@ export default function App() {
               strokeLinecap="round"
               style={{ transform: "rotate(-90deg)", transformOrigin: "22px 22px", transition: "stroke-dashoffset 0.3s ease" }} />
           </svg>
-          <p className="shutdown-title">Randomising connection closes…</p>
-          <p className="shutdown-subtitle">Staggering relay disconnects to make your mailboxes harder to correlate.</p>
+          <p className="shutdown-title">Closing connections…</p>
+          <p className="shutdown-subtitle">Disconnecting each conversation on a random delay so they're harder to correlate.</p>
           <div className="shutdown-bar"><div className="shutdown-bar-fill" style={{ width: `${pct}%` }} /></div>
           {total > 0 && <p className="shutdown-count">{closed} / {total}</p>}
         </div>
