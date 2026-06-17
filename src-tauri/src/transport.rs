@@ -33,6 +33,24 @@ const ONION_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(150);
 /// both keeps the circuit warm and surfaces a dead circuit fast (the failed
 /// write tears the connection down and triggers the frontend reconnect).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Hard ceiling on writing a single frame to the receive socket. Without it, a
+/// half-open Tor circuit (where the peer is gone but no FIN/RST ever arrives) lets
+/// `write.send().await` block forever: the keepalive Ping never goes out, no read
+/// error is produced, and the socket sits silently dead while the relay still
+/// believes this mailbox is offline — so messages queue and are never flushed.
+/// Bounding the write surfaces the dead circuit and triggers a reconnect. Kept
+/// well above the time a legitimate 512 KiB frame (a full file chunk) needs on a
+/// slow Tor circuit so it never aborts a real in-flight send; the read-idle
+/// timeout below is the primary half-open detector, this is the backstop against
+/// an indefinitely wedged write.
+const WRITE_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+/// If no frame at all (not even a keepalive Pong) is read within this window, the
+/// receive circuit is treated as dead and the connection is rebuilt. The writer
+/// Pings every [`KEEPALIVE_INTERVAL`] and the relay answers each with a Pong, so a
+/// healthy socket sees inbound traffic at least every 30s; 75s (2.5x) is generous
+/// enough never to trip a live-but-idle connection while still catching a silently
+/// half-open one deterministically, rather than relying solely on a write failure.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 /// Proof-of-work difficulty: the required number of leading zero bits on the
 /// SHA-256 of the challenge. This MUST equal the relay's `POW_LEADING_ZERO_BITS`
 /// (axeno-relay `config.rs`). The relay rejects any PoW with fewer leading zero
@@ -283,11 +301,14 @@ pub async fn connect_server(
     let task_server_id = server_id.clone();
     tokio::spawn(async move {
         let _ = emit_status(&app_for_task, &task_server_id, "connecting", None);
-        // Mark this connection as syncing for its whole lifetime up to the
-        // relay's `Synced` marker (set during the run). The backlog replay spans
-        // the Tor connect + handshake, so marking here — not at HelloOk — keeps
-        // the indicator on through the slow part too.
-        set_conn_syncing(&app_for_task, &syncing_conns, &task_server_id, true).await;
+        // The "syncing" flag is set inside run_websocket at HelloOk (when the
+        // relay begins replaying any offline backlog) and cleared on its `Synced`
+        // marker. It is deliberately NOT set here at the start of the connect
+        // attempt: the Tor circuit build/reconnect can be slow and can flap, and
+        // marking that whole phase as "syncing" made the indicator appear to stick
+        // on permanently during reconnect churn. Scoping it to the actual backlog
+        // flush makes it brief and meaningful; the "connecting"/"ready" status
+        // events above already cover the circuit-build phase.
         let result = run_connection(app_for_task.clone(), tor_client, pending_certs, pending_token_updates, pending_sends, pending_files, server_file_limits, trust_roots, syncing_conns.clone(), task_server_id.clone(), url, recipient_id, auth_token, delivery_token, rx, shutdown, Some(ready_tx)).await;
         remove_connection_if_same(&connections, &task_server_id, instance_id).await;
         // Cleanup: if the connection ended before `Synced` (e.g. it failed during
@@ -1312,7 +1333,14 @@ where
                 ClientFrame::SendEnvelope { client_ref, .. } => client_ref.clone(),
                 _ => None,
             };
-            if let Err(e) = send_frame(&mut write, frame).await {
+            // Bound the write so a wedged (half-open) Tor circuit can't pin the
+            // writer forever; a timeout is treated exactly like a write error so
+            // the connection unwinds and the frontend reconnect kicks in.
+            let write_outcome = match timeout(WRITE_FRAME_TIMEOUT, send_frame(&mut write, frame)).await {
+                Ok(result) => result,
+                Err(_) => Err("websocket write timed out".to_string()),
+            };
+            if let Err(e) = write_outcome {
                 if send_ref.is_some() {
                     let _ = writer_app.emit("axeno-send-failed", SendFailure {
                         server_id: writer_server_id.clone(),
@@ -1339,7 +1367,18 @@ where
             // stream is dropped below, closing the Tor stream now — the relay
             // sees this mailbox go offline at its own staggered time.
             _ = shutdown.notified() => break,
-            msg = read.next() => msg,
+            // Read with an idle ceiling: the relay never initiates traffic, so a
+            // healthy socket's only inbound when idle is the Pong answering each
+            // keepalive Ping. No frame within READ_IDLE_TIMEOUT means the receive
+            // circuit is silently dead — return an error so the connection rebuilds
+            // instead of blocking on read.next() forever and missing queued mail.
+            read_result = timeout(READ_IDLE_TIMEOUT, read.next()) => match read_result {
+                Ok(msg) => msg,
+                Err(_) => {
+                    if let Some(h) = sync_fallback.take() { h.abort(); }
+                    return Err("relay receive socket idle past keepalive window; reconnecting".to_string());
+                }
+            },
         };
         let Some(message) = next else { break; };
         let message = match message {
@@ -1377,6 +1416,13 @@ where
                 drop(roots);
                 if let Some(tx) = ready_tx.take() { let _ = tx.send(Ok(())); }
                 let _ = emit_status(&app, &server_id, "ready", None);
+                // Begin the "syncing" window: from here until the relay's `Synced`
+                // marker it replays any offline backlog for this mailbox. Set at
+                // HelloOk rather than at connect start so the indicator reflects
+                // only real backlog delivery, not the (possibly slow/flapping) Tor
+                // circuit build. Cleared by `Synced`, the pre-v6 fallback below, or
+                // connection end.
+                set_conn_syncing(&app, &syncing_conns, &server_id, true).await;
                 // Arm the pre-v6 fallback. A v6 relay's `Synced` aborts it.
                 if sync_fallback.is_none() {
                     let fb_app = app.clone();

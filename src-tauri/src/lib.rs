@@ -737,6 +737,37 @@ async fn messaging_connect_all(
 }
 
 #[tauri::command]
+async fn messaging_retry_pending(
+    app: AppHandle,
+    session: State<'_, AppSessionState>,
+    runtime: State<'_, messaging::MessagingRuntimeState>,
+    transport_state: State<'_, transport::TransportState>,
+    tor_state: State<'_, AppTorState>,
+) -> Result<(), String> {
+    // Uses non-Send libsignal futures (re-encryption), so run it off the UI thread
+    // on a dedicated current-thread runtime, matching messaging_send_text_message.
+    let session = session.inner().clone();
+    let runtime = runtime.inner().clone();
+    let transport_state = transport_state.inner().clone();
+    let tor_client = tor_state.client.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start resend worker runtime: {e}"))?
+            .block_on(messaging::retry_pending_sends(
+                app,
+                &session,
+                &runtime,
+                &transport_state,
+                tor_client,
+            ))
+    })
+    .await
+    .map_err(|e| format!("resend worker panicked or was cancelled: {e}"))?
+}
+
+#[tauri::command]
 async fn messaging_send_text_message(
     app: AppHandle,
     session: State<'_, AppSessionState>,
@@ -744,6 +775,7 @@ async fn messaging_send_text_message(
     tor_state: State<'_, AppTorState>,
     contact_id: String,
     text: String,
+    message_id: Option<String>,
 ) -> Result<messaging::SendMessageResponse, String> {
     // libsignal's current Rust store futures are not Send. Do not block the
     // Tauri/UI command thread with block_on; run the non-Send future on a
@@ -763,6 +795,7 @@ async fn messaging_send_text_message(
                 tor_client,
                 contact_id,
                 text,
+                message_id,
             ))
     })
     .await
@@ -982,6 +1015,7 @@ pub fn run() {
             messaging_delete_and_block_contact,
             messaging_snapshot,
             messaging_connect_all,
+            messaging_retry_pending,
             messaging_send_text_message,
             messaging_send_file_message,
             messaging_download_file,

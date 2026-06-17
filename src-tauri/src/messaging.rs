@@ -65,6 +65,12 @@ pub struct MessagingRuntimeState {
     /// which the UI triggers on every incoming message — from racing and
     /// flipping a still-in-flight send to "failed".
     startup_recovery_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Message ids the resend sweeper is currently re-transmitting. Prevents two
+    /// overlapping sweeps (it is triggered from several reconnect moments) from
+    /// transmitting the same message concurrently. The recipient dedups by inner
+    /// message_id, so a redundant resend is harmless regardless — this just avoids
+    /// wasted work and needless ratchet churn.
+    resending: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1090,6 +1096,35 @@ pub fn promote_rekey_sidecar(app: &AppHandle, new_root_key: &[u8; 32]) -> Result
 }
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
+
+/// Rank of an outgoing message's delivery status along the monotonic ladder
+/// `relay_pending` → `relay_queued` → `relay_received`. A status that is not on
+/// this ladder (notably `send_failed`, or any peer-side status) returns `None`
+/// and is treated as off-ladder: the monotonic setter leaves it untouched.
+fn mine_status_rank(status: &str) -> Option<u8> {
+    match status {
+        "relay_pending" => Some(1),
+        "relay_queued" => Some(2),
+        "relay_received" => Some(3),
+        _ => None,
+    }
+}
+
+/// Advance an outgoing message's status forward along the delivery ladder, never
+/// backward. The relay's `SendOk{queued}` and the peer's `delivery_ack` travel
+/// back to the sender over independent Tor circuits, so they routinely arrive
+/// out of order. Without a monotonic guard a late `SendOk{queued:true}` could
+/// downgrade a message the peer has already confirmed receiving (`relay_received`)
+/// back to `relay_queued`, leaving it stuck on "queued" forever even though it was
+/// delivered. Only a strictly higher-ranked status is applied; an off-ladder
+/// status (e.g. `send_failed`) is never silently resurrected here.
+fn advance_mine_status(msg: &mut StoredMessage, candidate: &str) {
+    if let (Some(cur), Some(new)) = (mine_status_rank(&msg.status), mine_status_rank(candidate)) {
+        if new > cur {
+            msg.status = candidate.to_string();
+        }
+    }
+}
 fn fill_random(buf: &mut [u8]) -> Result<(), String> { getrandom::getrandom(buf).map_err(|e| format!("OS randomness unavailable: {e}")) }
 
 /// Upper bound on the random per-route startup delay used to stagger connection
@@ -2628,6 +2663,35 @@ async fn send_signal_payload_internal(
         (contact, sender_route)
     };
 
+    // Mint the id/timestamp up front (a file send forces its id from the UI). For
+    // a visible text, persist the row as relay_pending NOW — before the sender
+    // certificate and Tor send, which can take tens of seconds on a cold circuit.
+    // Persisting late was why a send could "vanish": during that window a snapshot
+    // refresh (triggered by any inbound event) replaced the UI with a store that
+    // did not yet contain the message, wiping the optimistic bubble, and the row
+    // only materialized — stuck at relay_pending — in time for the restart sweep to
+    // flip it to failed. A durable row from t0 means the UI can always recover it
+    // and the resend sweeper (retry_pending_sends) can finish the job.
+    let message_id = forced_message_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let sent_at = now_ms();
+    if visible && payload_kind == "text" {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        if !store.messages.iter().any(|m| m.id == message_id && m.mine) {
+            store.messages.push(StoredMessage {
+                id: message_id.clone(),
+                contact_id: contact_id.clone(),
+                mine: true,
+                text: trimmed.clone(),
+                timestamp: sent_at,
+                received_at_ms: None,
+                status: "relay_pending".to_string(),
+                attachment: None,
+            });
+            save_store_with_key(&app, &store, &store_key)?;
+        }
+    }
+
     let connection_id_for_cert = route_connection_id(&sender_route_for_cert);
     let cert = match transport::request_sender_certificate(
         transport_state,
@@ -2675,11 +2739,6 @@ async fn send_signal_payload_internal(
             cert
         }
     };
-
-    // A file send pre-generates its id in the UI so the optimistic bubble and the
-    // upload-progress events share one id; everything else mints a fresh id here.
-    let message_id = forced_message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let sent_at = now_ms();
 
     // For a file send, upload the encrypted blob now — to the sender's own relay
     // (`sender_route_for_cert`, the warm connection that just issued the cert) —
@@ -2759,20 +2818,34 @@ async fn send_signal_payload_internal(
         let padded = pad_ciphertext(&encrypted.sealed_sender)?;
         let wire = SealedSignalWireMessage { v: 1, sealed_sender_b64: STANDARD_NO_PAD.encode(padded) };
         let maybe_msg = if visible {
-            let msg = StoredMessage {
-                id: message_id.clone(),
-                contact_id: contact.id.clone(),
-                mine: true,
-                // A file bubble renders from its attachment, not body text (which
-                // is the opaque pointer JSON), so keep the visible text empty.
-                text: if payload_kind == "file" { String::new() } else { trimmed.clone() },
-                timestamp: sent_at,
-                received_at_ms: None,
-                status: "relay_pending".to_string(),
-                attachment: file_attachment.clone(),
-            };
-            store.messages.push(msg.clone());
-            Some(msg)
+            // Upsert by id: a text send already persisted this row up front (and a
+            // resend reuses the same id), so update in place rather than pushing a
+            // duplicate. Only a fresh file send actually inserts here.
+            let text_for_store = if payload_kind == "file" { String::new() } else { trimmed.clone() };
+            if let Some(existing) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
+                existing.text = text_for_store;
+                existing.timestamp = sent_at;
+                existing.attachment = file_attachment.clone();
+                // Keep status monotonic: an in-flight ack may already have advanced
+                // it; never knock it back to relay_pending on a re-entry/resend.
+                advance_mine_status(existing, "relay_pending");
+                Some(existing.clone())
+            } else {
+                let msg = StoredMessage {
+                    id: message_id.clone(),
+                    contact_id: contact.id.clone(),
+                    mine: true,
+                    // A file bubble renders from its attachment, not body text (which
+                    // is the opaque pointer JSON), so keep the visible text empty.
+                    text: text_for_store,
+                    timestamp: sent_at,
+                    received_at_ms: None,
+                    status: "relay_pending".to_string(),
+                    attachment: file_attachment.clone(),
+                };
+                store.messages.push(msg.clone());
+                Some(msg)
+            }
         } else {
             None
         };
@@ -2824,14 +2897,14 @@ async fn send_signal_payload_internal(
     match send_result {
         Ok(ack) => {
             if visible {
-                let next_status = if ack.queued { "relay_queued" } else { "relay_received" }.to_string();
-                if let Some(ref mut msg) = maybe_msg {
-                    msg.status = next_status.clone();
-                }
+                // Advance the stored status monotonically: a peer `delivery_ack`
+                // (relay_received) can land before this `SendOk{queued:true}` over
+                // a faster circuit, and must not be downgraded back to queued.
+                let candidate = if ack.queued { "relay_queued" } else { "relay_received" };
                 let _store_guard = session.messaging_store_lock.lock().await;
                 if let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) {
                     if let Some(stored) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
-                        stored.status = next_status;
+                        advance_mine_status(stored, candidate);
                         if let Some(ref mut msg) = maybe_msg {
                             *msg = stored.clone();
                         }
@@ -2891,6 +2964,7 @@ pub async fn send_text_message(
     tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
     contact_id: String,
     text: String,
+    forced_message_id: Option<String>,
 ) -> Result<SendMessageResponse, String> {
     let message = send_signal_payload_internal(
         app,
@@ -2903,10 +2977,116 @@ pub async fn send_text_message(
         true,
         false,
         None,
-        None,
+        forced_message_id,
     ).await?
     .ok_or_else(|| "message send did not produce a local message".to_string())?;
     Ok(SendMessageResponse { message })
+}
+
+/// Minimum age before a still-`relay_pending` send is treated as stalled and
+/// eligible for resend. Generous so it never races a legitimately in-flight send
+/// (a cold-circuit certificate + send can take a while); the recipient's
+/// message_id dedup makes an over-eager resend harmless anyway.
+const RESEND_PENDING_MIN_AGE_MS: u64 = 60 * 1000;
+/// Cap how many stalled sends a single sweep drains, so a large backlog can't
+/// fan out into a burst of concurrent Tor sends. The next sweep takes the rest.
+const RESEND_MAX_PER_SWEEP: usize = 16;
+
+/// Re-transmit outgoing TEXT messages that never reached the relay: status
+/// `send_failed`, or `relay_pending` for longer than [`RESEND_PENDING_MIN_AGE_MS`]
+/// (the original attempt died with the process, or stalled on a cold circuit).
+///
+/// This is the durability backstop that turns "best-effort send" into "send that
+/// eventually lands". It is safe to call repeatedly and concurrently: the
+/// recipient dedups by inner message_id (see `handle_incoming_envelope`), so a
+/// resend can never double-deliver — the worst case is one extra Signal ratchet
+/// message the peer discards — and the in-memory `resending` guard stops two
+/// sweeps from re-sending the same id at once. File sends are deliberately not
+/// retried here (resending would require re-uploading the blob); those are left
+/// as `send_failed` for the user to resend manually.
+pub async fn retry_pending_sends(
+    app: AppHandle,
+    session: &AppSessionState,
+    runtime: &MessagingRuntimeState,
+    transport_state: &transport::TransportState,
+    tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
+) -> Result<(), String> {
+    // Wait for the one-time startup recovery sweep to reclassify a prior process's
+    // orphaned relay_pending rows to send_failed first, so we act on a settled set
+    // rather than racing it.
+    if !runtime.startup_recovery_done.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    let (store_key, legacy_store_key) = store_keys(session).await?;
+    let candidates: Vec<(String, String, String)> = {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        let now = now_ms();
+        store
+            .messages
+            .iter()
+            .filter(|m| m.mine && m.attachment.is_none() && !m.text.trim().is_empty())
+            .filter(|m| {
+                m.status == "send_failed"
+                    || (m.status == "relay_pending"
+                        && now.saturating_sub(m.timestamp) >= RESEND_PENDING_MIN_AGE_MS)
+            })
+            .map(|m| (m.id.clone(), m.contact_id.clone(), m.text.clone()))
+            .collect()
+    };
+
+    let mut resent = 0usize;
+    for (message_id, contact_id, text) in candidates {
+        if resent >= RESEND_MAX_PER_SWEEP {
+            break;
+        }
+        // Claim this id; skip if another sweep already owns it.
+        if !runtime.resending.lock().await.insert(message_id.clone()) {
+            continue;
+        }
+        // Reflect the in-flight retry in the UI (and clear a prior send_failed).
+        reset_send_status_to_pending(&app, session, &store_key, &legacy_store_key, &message_id).await;
+        let result = send_signal_payload_internal(
+            app.clone(),
+            session,
+            transport_state,
+            tor_client.clone(),
+            contact_id,
+            "text",
+            text,
+            true,
+            false,
+            None,
+            Some(message_id.clone()),
+        )
+        .await;
+        runtime.resending.lock().await.remove(&message_id);
+        if result.is_ok() {
+            resent += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Reset a stalled/failed outgoing message back to `relay_pending` so the UI shows
+/// it as sending again while a resend is attempted. Emits an `axeno-send-receipt`
+/// so the open UI updates without waiting for the next snapshot.
+async fn reset_send_status_to_pending(
+    app: &AppHandle,
+    session: &AppSessionState,
+    store_key: &[u8; 32],
+    legacy_store_key: &[u8; 32],
+    message_id: &str,
+) {
+    let _store_guard = session.messaging_store_lock.lock().await;
+    if let Ok(mut store) = load_store_with_keys(app, store_key, legacy_store_key) {
+        if let Some(m) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
+            if m.status == "send_failed" {
+                m.status = "relay_pending".to_string();
+                let _ = save_store_with_key(app, &store, store_key);
+            }
+        }
+    }
 }
 
 /// Progress for an in-flight file transfer, emitted as `axeno-file-progress`.
@@ -3449,8 +3629,14 @@ pub async fn handle_incoming_envelope(
         // relay_queued → relay_received to show the peer actually got it.
         let acked_id = decrypted.message.body.trim().to_string();
         if !acked_id.is_empty() {
+            // The ack proves the peer received this message, so upgrade it to
+            // relay_received regardless of whether the relay's own SendOk has
+            // landed yet. Matching only "relay_queued" (the old guard) silently
+            // dropped any ack that beat the SendOk over a faster Tor circuit,
+            // leaving the message stuck on "queued" forever despite delivery.
             if let Some(stored) = store.messages.iter_mut().find(|m| {
-                m.id == acked_id && m.mine && m.contact_id == contact_id && m.status == "relay_queued"
+                m.id == acked_id && m.mine && m.contact_id == contact_id
+                    && (m.status == "relay_pending" || m.status == "relay_queued")
             }) {
                 stored.status = "relay_received".to_string();
                 delivery_ack_upgraded_msg_id = Some(acked_id);
@@ -3599,7 +3785,11 @@ pub async fn mark_message_relay_received(app: AppHandle, session: &AppSessionSta
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     let Some(msg) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) else { return Ok(None); };
-    msg.status = if queued { "relay_queued".to_string() } else { "relay_received".to_string() };
+    // Monotonic: this is driven by the `axeno-send-receipt` event, which fires for
+    // both the relay's SendOk and the peer's delivery_ack. They race over separate
+    // circuits, so apply the candidate only if it moves the status forward — never
+    // downgrade a delivered (relay_received) message back to relay_queued.
+    advance_mine_status(msg, if queued { "relay_queued" } else { "relay_received" });
     let out = msg.clone();
     save_store_with_key(&app, &store, &store_key)?;
     Ok(Some(out))

@@ -61,6 +61,38 @@ function groupMessages(snapshot: MessagingSnapshot): Record<string, Message[]> {
   return result;
 }
 
+// Statuses for an outgoing message that is still being delivered. A message in
+// one of these states that the backend snapshot does not yet contain is an
+// in-flight optimistic bubble (the brief window before the backend persists it),
+// and must survive a snapshot refresh rather than vanish.
+const IN_FLIGHT_MINE_STATUSES = new Set(["relay_pending", "relay_queued", "send_failed"]);
+
+// Merge a fresh backend snapshot over the current UI state. The snapshot is
+// authoritative for every message id it contains, but a just-sent bubble can be
+// missing from it for a moment (a refresh, triggered by any inbound event, can
+// land between the optimistic add and the backend persisting the row). Preserving
+// those recent in-flight mine-messages is what stops a send from "disappearing".
+function mergeSnapshotMessages(
+  prev: Record<string, Message[]>,
+  snapshot: MessagingSnapshot,
+): Record<string, Message[]> {
+  const grouped = groupMessages(snapshot);
+  const now = Date.now();
+  Object.entries(prev).forEach(([contactId, msgs]) => {
+    const snapList = grouped[contactId] ?? [];
+    const snapIds = new Set(snapList.map(m => m.id));
+    const survivors = msgs.filter(m =>
+      m.mine &&
+      !snapIds.has(m.id) &&
+      IN_FLIGHT_MINE_STATUSES.has(m.status ?? "") &&
+      now - m.timestamp < 5 * 60 * 1000,
+    );
+    if (survivors.length === 0) return;
+    grouped[contactId] = [...snapList, ...survivors].sort((a, b) => a.timestamp - b.timestamp);
+  });
+  return grouped;
+}
+
 export default function App() {
   const [appState, setAppState] = useState<"loading" | "onboarding" | "login" | "chat">("loading");
   const [torStatus, setTorStatus] = useState<TorStatus>("connecting");
@@ -80,6 +112,9 @@ export default function App() {
   const [activeContactId, setActiveContactId] = useState("");
   const activeContactIdRef = useRef("");
   const reconnectTimersRef = useRef<Record<string, number>>({});
+  // Debounce for the resend sweeper so a burst of route "ready" events collapses
+  // into a single retry pass.
+  const retryTimerRef = useRef<number | null>(null);
 
   // Non-blocking "syncing messages" indicator, driven by the backend's
   // authoritative `axeno-sync-status` event: it reports true while any relay
@@ -202,7 +237,7 @@ export default function App() {
     const snap = await invoke<MessagingSnapshot>("messaging_snapshot");
     const nextContacts = snap.contacts.map(contactFromBackend);
     setContacts(nextContacts);
-    setMessages(groupMessages(snap));
+    setMessages(prev => mergeSnapshotMessages(prev, snap));
     setActiveContactId(prev => prev || nextContacts[0]?.id || "");
     return nextContacts;
   }, []);
@@ -222,6 +257,23 @@ export default function App() {
     const maxJitterMs = await invoke<number>("messaging_connect_all").catch(() => 0);
     if (showBanner) startConnectStaggerIndicator(maxJitterMs);
   }, [startConnectStaggerIndicator]);
+
+  // Drain outgoing messages that never reached the relay (stalled relay_pending or
+  // send_failed). The backend resend is idempotent and dedup-safe; this just pokes
+  // it at the right moments (a route became ready, periodic backstop) and then
+  // pulls the refreshed statuses into the UI. Debounced so a burst of "ready"
+  // events triggers one pass.
+  const retryPendingSends = useCallback(() => {
+    if (lockedRef.current) return;
+    if (retryTimerRef.current !== null) return;
+    retryTimerRef.current = window.setTimeout(async () => {
+      retryTimerRef.current = null;
+      try {
+        await invoke("messaging_retry_pending");
+        await refreshSnapshot();
+      } catch { /* best effort */ }
+    }, 2000);
+  }, [refreshSnapshot]);
 
   // Initial session load: refresh the snapshot, then connect all routes (banner).
   const loadMessaging = useCallback(async () => {
@@ -384,6 +436,8 @@ export default function App() {
           window.clearTimeout(existing);
           delete reconnectTimersRef.current[serverId];
         }
+        // A route just came up: a good moment to flush any stalled outgoing sends.
+        if (status === "ready") retryPendingSends();
         return;
       }
       if (status !== "failed" && status !== "disconnected") return;
@@ -491,6 +545,10 @@ export default function App() {
     };
     init();
 
+    // Periodic backstop for the resend sweeper: even with no route-status churn,
+    // poke it every 30s so a stalled send eventually lands once a circuit is up.
+    const retryInterval = window.setInterval(() => retryPendingSends(), 30000);
+
     return () => {
       unlistenTor.then(f => f());
       unlistenSyncStatus.then(f => f());
@@ -501,12 +559,17 @@ export default function App() {
       unlistenMessage.then(f => f());
       Object.values(reconnectTimersRef.current).forEach(timer => window.clearTimeout(timer));
       reconnectTimersRef.current = {};
+      window.clearInterval(retryInterval);
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       if (connectCountdownTimerRef.current !== null) {
         window.clearInterval(connectCountdownTimerRef.current);
         connectCountdownTimerRef.current = null;
       }
     };
-  }, [refreshSnapshot, connectAll, loadPrivateServerSettings, markContactRead, applySyncStatus]);
+  }, [refreshSnapshot, connectAll, loadPrivateServerSettings, markContactRead, applySyncStatus, retryPendingSends]);
 
   // Intercept the window close: hold it open, stagger-close the relay sockets so
   // a logging relay can't see all our mailboxes drop in one burst, then destroy
@@ -581,10 +644,14 @@ export default function App() {
   };
 
   const sendMessage = async (contactId: string, text: string) => {
-    // Optimistic: show bubble immediately with "sending" status
-    const optimisticId = `pending_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    // Share one id between the optimistic bubble, the backend store row, and the
+    // wire message. Previously the optimistic id was a throwaway `pending_…` that
+    // could never match the backend's minted id, so if a snapshot refresh replaced
+    // the list mid-send the bubble was orphaned and lost. A stable id makes the
+    // bubble reconcilable and lets the backend persist/resend under the same id.
+    const messageId = (crypto as Crypto).randomUUID();
     const optimisticMsg: Message = {
-      id: optimisticId,
+      id: messageId,
       text,
       mine: true,
       timestamp: Date.now(),
@@ -593,18 +660,20 @@ export default function App() {
     setMessages(prev => ({ ...prev, [contactId]: [...(prev[contactId] ?? []), optimisticMsg] }));
 
     try {
-      const res = await invoke<SendMessageResponse>("messaging_send_text_message", { contactId, text });
+      const res = await invoke<SendMessageResponse>("messaging_send_text_message", { contactId, text, messageId });
       const msg = messageFromBackend(res.message);
       // Replace optimistic message with real one from backend
       setMessages(prev => {
         const existing = prev[contactId] ?? [];
-        return { ...prev, [contactId]: existing.map(m => m.id === optimisticId ? msg : m) };
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId ? msg : m) };
       });
     } catch (e) {
-      // Mark optimistic message as failed
+      // The send threw, but the row was already persisted as relay_pending and the
+      // resend sweeper will keep retrying it; show it as failed for now so the user
+      // sees a truthful state rather than the bubble vanishing.
       setMessages(prev => {
         const existing = prev[contactId] ?? [];
-        return { ...prev, [contactId]: existing.map(m => m.id === optimisticId ? { ...m, status: "send_failed" } : m) };
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId ? { ...m, status: "send_failed" } : m) };
       });
       throw e;
     }
