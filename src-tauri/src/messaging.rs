@@ -1098,11 +1098,20 @@ pub fn promote_rekey_sidecar(app: &AppHandle, new_root_key: &[u8; 32]) -> Result
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
 /// Rank of an outgoing message's delivery status along the monotonic ladder
-/// `relay_pending` → `relay_queued` → `relay_received`. A status that is not on
-/// this ladder (notably `send_failed`, or any peer-side status) returns `None`
-/// and is treated as off-ladder: the monotonic setter leaves it untouched.
+/// `send_failed` → `relay_pending` → `relay_queued` → `relay_received`. A status
+/// that is not on this ladder (a peer-side status) returns `None` and is treated
+/// as off-ladder: the monotonic setter leaves it untouched.
+///
+/// `send_failed` sits at the BOTTOM (rank 0), not off-ladder, on purpose: a
+/// failure signal and a delivery confirmation race back to the sender over
+/// independent Tor circuits, and the warm-connection writer can report a write
+/// failure for a frame that a fallback circuit (or an earlier attempt) already
+/// delivered. Ranking `send_failed` below the confirmed states lets a real
+/// relay ack or peer `delivery_ack` lift a wrongly-failed message back onto the
+/// ladder, instead of leaving a delivered message stuck displaying "failed".
 fn mine_status_rank(status: &str) -> Option<u8> {
     match status {
+        "send_failed" => Some(0),
         "relay_pending" => Some(1),
         "relay_queued" => Some(2),
         "relay_received" => Some(3),
@@ -1116,13 +1125,33 @@ fn mine_status_rank(status: &str) -> Option<u8> {
 /// out of order. Without a monotonic guard a late `SendOk{queued:true}` could
 /// downgrade a message the peer has already confirmed receiving (`relay_received`)
 /// back to `relay_queued`, leaving it stuck on "queued" forever even though it was
-/// delivered. Only a strictly higher-ranked status is applied; an off-ladder
-/// status (e.g. `send_failed`) is never silently resurrected here.
+/// delivered. Only a strictly higher-ranked status is applied. Because
+/// `send_failed` ranks below the confirmed states, a confirmed ack here also
+/// clears a transient/false failure (see `mine_status_rank`).
 fn advance_mine_status(msg: &mut StoredMessage, candidate: &str) {
     if let (Some(cur), Some(new)) = (mine_status_rank(&msg.status), mine_status_rank(candidate)) {
         if new > cur {
             msg.status = candidate.to_string();
         }
+    }
+}
+
+/// Mark an outgoing message `send_failed`, but ONLY while it is still unconfirmed
+/// by the relay (currently `relay_pending`, or already `send_failed`). A failure
+/// event can arrive late — after the message actually landed via the one-shot
+/// fallback circuit or a resend, or after the peer's `delivery_ack` already
+/// advanced it — so it must never clobber a message the relay/peer has confirmed
+/// (`relay_queued`/`relay_received`). Returns true if the status changed.
+fn mark_send_failed_monotonic(msg: &mut StoredMessage) -> bool {
+    match mine_status_rank(&msg.status) {
+        // send_failed (0) is a no-op; relay_pending (1) downgrades to failed.
+        Some(rank) if rank <= 1 => {
+            let changed = msg.status != "send_failed";
+            msg.status = "send_failed".to_string();
+            changed
+        }
+        // relay_queued / relay_received / off-ladder: keep the confirmed status.
+        _ => false,
     }
 }
 fn fill_random(buf: &mut [u8]) -> Result<(), String> { getrandom::getrandom(buf).map_err(|e| format!("OS randomness unavailable: {e}")) }
@@ -2920,14 +2949,18 @@ async fn send_signal_payload_internal(
             }
         }
         Err(err_msg) => {
-            if let Some(ref mut msg) = maybe_msg {
-                msg.status = "send_failed".to_string();
-            }
+            // Persist failure monotonically: a resend of a message the peer already
+            // received (its `delivery_ack` advanced it to `relay_received`) can fail
+            // on this attempt, and must not be knocked back to `send_failed`. The
+            // store is authoritative; mirror its post-guard status into `maybe_msg`.
             let _store_guard = session.messaging_store_lock.lock().await;
             if let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) {
-                if let Some(stored) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
-                    stored.status = "send_failed".to_string();
-                    let _ = save_store_with_key(&app, &store, &store_key);
+                let updated = store.messages.iter_mut()
+                    .find(|m| m.id == message_id && m.mine)
+                    .map(|stored| (mark_send_failed_monotonic(stored), stored.clone()));
+                if let Some((changed, snapshot)) = updated {
+                    if changed { let _ = save_store_with_key(&app, &store, &store_key); }
+                    if let Some(ref mut msg) = maybe_msg { *msg = snapshot; }
                 }
             }
             let _ = app.emit("axeno-send-failed", transport::SendFailure {
@@ -3374,6 +3407,15 @@ pub async fn download_file(
                 return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file chunk failed to decrypt (wrong key or corrupted)".to_string()));
             }
         };
+        // Enforce the declared size as we go, not only at the end: a malicious
+        // sender holds the file key and can encrypt oversized chunks, so without a
+        // running cap they could stream far more than the size the user agreed to
+        // download before the final mismatch check deletes the partial. Abort the
+        // moment the cumulative plaintext would exceed the declared total.
+        if written.saturating_add(plain.len() as u64) > attachment.size {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file is larger than its declared size".to_string()));
+        }
         if let Err(e) = file.write_all(&plain) {
             let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
             return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not write download: {e}")));
@@ -3629,17 +3671,21 @@ pub async fn handle_incoming_envelope(
         // relay_queued → relay_received to show the peer actually got it.
         let acked_id = decrypted.message.body.trim().to_string();
         if !acked_id.is_empty() {
-            // The ack proves the peer received this message, so upgrade it to
-            // relay_received regardless of whether the relay's own SendOk has
-            // landed yet. Matching only "relay_queued" (the old guard) silently
-            // dropped any ack that beat the SendOk over a faster Tor circuit,
-            // leaving the message stuck on "queued" forever despite delivery.
+            // The ack is the peer's proof of receipt — the strongest delivery
+            // signal there is — so advance the message to relay_received from
+            // anywhere below it on the ladder. Crucially this includes a message
+            // wrongly left at `send_failed` by a racing/stale write error: a real
+            // ack means it WAS delivered, so it must recover rather than stay
+            // "failed". `advance_mine_status` never downgrades an already-received
+            // one, and is a no-op for an off-ladder status.
             if let Some(stored) = store.messages.iter_mut().find(|m| {
                 m.id == acked_id && m.mine && m.contact_id == contact_id
-                    && (m.status == "relay_pending" || m.status == "relay_queued")
             }) {
-                stored.status = "relay_received".to_string();
-                delivery_ack_upgraded_msg_id = Some(acked_id);
+                let before = stored.status.clone();
+                advance_mine_status(stored, "relay_received");
+                if stored.status != before {
+                    delivery_ack_upgraded_msg_id = Some(acked_id);
+                }
             }
         }
         None
@@ -3800,9 +3846,13 @@ pub async fn mark_message_send_failed(app: AppHandle, session: &AppSessionState,
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     let Some(msg) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) else { return Ok(None); };
-    msg.status = "send_failed".to_string();
+    // Only fail an unconfirmed send. A `send_failed` event routinely arrives late
+    // — the warm-connection writer reports a stale frame's write failure after a
+    // fallback circuit already delivered the message — and must not clobber a
+    // message the relay/peer has already confirmed.
+    let changed = mark_send_failed_monotonic(msg);
     let out = msg.clone();
-    save_store_with_key(&app, &store, &store_key)?;
+    if changed { save_store_with_key(&app, &store, &store_key)?; }
     Ok(Some(out))
 }
 
@@ -4911,5 +4961,62 @@ mod route_tests {
         let old_route = store.local_routes.iter().find(|r| r.id == retiring_id).unwrap();
         assert!(old_route.active);
         assert_eq!(old_route.replacement_route_id.as_deref(), Some(outcome.route.id.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod status_ladder_tests {
+    use super::*;
+
+    fn mine(status: &str) -> StoredMessage {
+        StoredMessage {
+            id: "m".to_string(),
+            contact_id: "c".to_string(),
+            mine: true,
+            text: "hi".to_string(),
+            timestamp: 0,
+            received_at_ms: None,
+            status: status.to_string(),
+            attachment: None,
+        }
+    }
+
+    #[test]
+    fn late_failure_does_not_clobber_a_confirmed_send() {
+        // The peer already confirmed receipt; a stale write-failure event then
+        // arrives. The message must stay delivered, not flip back to failed.
+        for confirmed in ["relay_queued", "relay_received"] {
+            let mut m = mine(confirmed);
+            let changed = mark_send_failed_monotonic(&mut m);
+            assert!(!changed, "{confirmed} must not change");
+            assert_eq!(m.status, confirmed);
+        }
+    }
+
+    #[test]
+    fn failure_applies_while_still_pending() {
+        let mut m = mine("relay_pending");
+        assert!(mark_send_failed_monotonic(&mut m));
+        assert_eq!(m.status, "send_failed");
+        // Idempotent: failing an already-failed message reports no change.
+        assert!(!mark_send_failed_monotonic(&mut m));
+    }
+
+    #[test]
+    fn confirmed_ack_lifts_a_wrongly_failed_message() {
+        // A message marked failed by a racing write error, then the real relay ack
+        // (or peer delivery_ack) lands: it must recover onto the delivery ladder.
+        let mut m = mine("send_failed");
+        advance_mine_status(&mut m, "relay_queued");
+        assert_eq!(m.status, "relay_queued");
+        advance_mine_status(&mut m, "relay_received");
+        assert_eq!(m.status, "relay_received");
+    }
+
+    #[test]
+    fn confirmed_status_is_never_downgraded() {
+        let mut m = mine("relay_received");
+        advance_mine_status(&mut m, "relay_queued");
+        assert_eq!(m.status, "relay_received");
     }
 }
