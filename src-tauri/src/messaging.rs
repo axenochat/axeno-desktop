@@ -5020,3 +5020,200 @@ mod status_ladder_tests {
         assert_eq!(m.status, "relay_received");
     }
 }
+
+#[cfg(test)]
+mod messaging_roundtrip_tests {
+    //! Full two-party messaging round-trip with REAL libsignal crypto: a fresh
+    //! identity (Alice) builds a Signal session to another (Bob) from Bob's
+    //! connection-code prekey bundle, encrypts a sealed-sender message under a
+    //! relay-style sender certificate, and Bob decrypts it — recovering the
+    //! plaintext, Bob's consumed one-time prekey, and Alice's stable identity.
+    //! This exercises X3DH/PQXDH, the double-ratchet init, libsignal sealed
+    //! sender, the certificate trust-root validation, and the Axeno plaintext
+    //! envelope encode/decode end to end (no relay process needed: the engine
+    //! functions operate on plain structs).
+
+    use super::*;
+    use crate::identity::create_identity;
+    use libsignal_protocol::{
+        DeviceId, KeyPair, PublicKey, SenderCertificate, ServerCertificate, Timestamp,
+    };
+
+    fn material_from(secrets: &crate::identity::VaultSecrets) -> PrivateSignalMaterial {
+        PrivateSignalMaterial {
+            identity_priv: secrets.identity_priv.clone(),
+            spk_priv: secrets.spk_priv.clone(),
+            previous_spks_secret: secrets.previous_spks_secret.clone(),
+            opks_secret: secrets.opks_secret.clone(),
+            display_name: secrets.display_name.clone(),
+        }
+    }
+
+    /// Mint a sender certificate exactly the way the relay does (fresh trust root
+    /// + server signing key, a ServerCertificate, then a SenderCertificate over the
+    /// sender's route certificate key), returning the cert response and the
+    /// matching trust-root the recipient validates against.
+    fn mint_cert(route_cert_pub_b64: &str, sender_uuid: &str) -> (transport::SenderCertificateResponse, String) {
+        let mut rng = fresh_signal_rng().unwrap();
+        let trust_root = KeyPair::generate(&mut rng);
+        let server_signing = KeyPair::generate(&mut rng);
+        let server_cert = ServerCertificate::new(1, server_signing.public_key, &trust_root.private_key, &mut rng).unwrap();
+        let sender_public = PublicKey::deserialize(&STANDARD_NO_PAD.decode(route_cert_pub_b64).unwrap()).unwrap();
+        let device: DeviceId = 1u32.try_into().unwrap();
+        let expires = now_ms() + 24 * 60 * 60 * 1000;
+        let cert = SenderCertificate::new(
+            sender_uuid.to_string(),
+            None,
+            sender_public,
+            device,
+            Timestamp::from_epoch_millis(expires),
+            server_cert,
+            &server_signing.private_key,
+            &mut rng,
+        ).unwrap();
+        let cert_b64 = STANDARD_NO_PAD.encode(cert.serialized().unwrap());
+        let trust_root_b64 = STANDARD_NO_PAD.encode(trust_root.public_key.serialize());
+        (
+            transport::SenderCertificateResponse { certificate_b64: cert_b64, trust_root_b64: trust_root_b64.clone(), expires_at_ms: expires },
+            trust_root_b64,
+        )
+    }
+
+    #[tokio::test]
+    async fn alice_to_bob_sealed_sender_round_trip() {
+        let server_url = normalize_server_url(Some("ws://127.0.0.1:8787/ws".to_string()));
+
+        // Two real identities.
+        let alice = create_identity("alice-passphrase", "Alice").unwrap();
+        let bob = create_identity("bob-passphrase", "Bob").unwrap();
+        let alice_material = material_from(&alice.secrets);
+        let bob_material = material_from(&bob.secrets);
+
+        let mut alice_store = MessagingStore::default();
+        let mut bob_store = MessagingStore::default();
+
+        // Bob's receive route — its mailbox id is the address Alice will send to.
+        let bob_route = new_local_route(server_url.clone(), "pending_invite".to_string(), None).unwrap();
+        // Bob's PQXDH Kyber prekey (part of his connection code).
+        let bob_kyber = signal_protocol_engine::ensure_local_kyber_prekey(&bob.blob, &bob_material, &mut bob_store).unwrap();
+
+        // Bob's connection-code payload, turned into Alice's view of Bob.
+        let bob_opk = &bob.blob.opks_public[0];
+        let payload = InvitePayload {
+            v: 1,
+            protocol: PROTOCOL_SIGNAL.to_string(),
+            display_name: "Bob".to_string(),
+            mailbox_id: bob_route.mailbox_id.clone(),
+            delivery_token: bob_route.delivery_token.clone(),
+            server_url: server_url.clone(),
+            device_id: DEVICE_ID,
+            identity_public_b64: STANDARD_NO_PAD.encode(&bob.blob.public_key),
+            registration_id: bob.blob.registration_id as u32,
+            signed_prekey_id: bob.blob.signed_prekey_id,
+            signed_prekey_public_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_public),
+            signed_prekey_signature_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_signature),
+            opk_id: Some(bob_opk.id),
+            opk_public_b64: Some(STANDARD_NO_PAD.encode(&bob_opk.public_key)),
+            kyber_prekey_id: Some(bob_kyber.id),
+            kyber_prekey_public_b64: Some(bob_kyber.public_b64.clone()),
+            kyber_prekey_signature_b64: Some(bob_kyber.signature_b64.clone()),
+            created_at_ms: now_ms(),
+        };
+        let bob_contact = contact_from_payload(payload, &alice.blob.public_key).unwrap();
+
+        // Alice's sender route + a matching relay-issued certificate.
+        let alice_route = new_local_route(server_url.clone(), contact_route_scope(&bob_contact.id), None).unwrap();
+        let (cert, trust_root_b64) = mint_cert(&alice_route.sealed_sender_cert_public_b64, &alice_route.mailbox_id);
+
+        // Alice encrypts a sealed-sender text for Bob (X3DH establishes the session).
+        let sent_at = now_ms();
+        let encrypted = signal_protocol_engine::encrypt_for_contact(
+            &alice.blob,
+            &alice_material,
+            &bob_contact,
+            &alice_route,
+            &alice_route,
+            &mut alice_store,
+            "text",
+            "hello bob — this is end to end",
+            "msg-roundtrip-1",
+            sent_at,
+            &cert,
+            false,
+            None,
+        ).await.expect("alice encrypt");
+        assert!(!encrypted.sealed_sender.is_empty());
+
+        // Bob decrypts it from his receive route, validating the certificate against
+        // the trust root Alice's relay would have pinned.
+        let decrypted = signal_protocol_engine::decrypt_sealed_sender_message(
+            &bob.blob,
+            &bob_material,
+            &mut bob_store,
+            &bob_route,
+            "srv_test",
+            &trust_root_b64,
+            &encrypted.sealed_sender,
+        ).await.expect("bob decrypt");
+
+        // The plaintext, the message id, and the kind all round-tripped.
+        assert_eq!(decrypted.message.body, "hello bob — this is end to end");
+        assert_eq!(decrypted.message.kind, "text");
+        assert_eq!(decrypted.message.message_id, "msg-roundtrip-1");
+        assert_eq!(decrypted.message.sent_at_ms, sent_at);
+        // Bob learned Alice's STABLE identity from inside the sealed envelope.
+        assert_eq!(decrypted.contact.identity_public_b64, STANDARD_NO_PAD.encode(&alice.blob.public_key));
+        assert_eq!(decrypted.contact.display_name.as_deref(), Some("Alice"));
+        // The prekey message consumed exactly Bob's advertised one-time prekey.
+        assert_eq!(decrypted.consumed_opk_ids, vec![bob_opk.id]);
+        // Bob persisted a Signal session for the conversation.
+        assert!(!bob_store.signal_sessions.is_empty(), "a ratchet session should be stored");
+    }
+
+    #[tokio::test]
+    async fn tampered_sealed_sender_is_rejected() {
+        // Integrity: flipping a byte of the sealed envelope must fail decryption,
+        // never silently surface altered plaintext.
+        let server_url = normalize_server_url(Some("ws://127.0.0.1:8787/ws".to_string()));
+        let alice = create_identity("a", "Alice").unwrap();
+        let bob = create_identity("b", "Bob").unwrap();
+        let alice_material = material_from(&alice.secrets);
+        let bob_material = material_from(&bob.secrets);
+        let mut alice_store = MessagingStore::default();
+        let mut bob_store = MessagingStore::default();
+
+        let bob_route = new_local_route(server_url.clone(), "pending_invite".to_string(), None).unwrap();
+        let bob_kyber = signal_protocol_engine::ensure_local_kyber_prekey(&bob.blob, &bob_material, &mut bob_store).unwrap();
+        let bob_opk = &bob.blob.opks_public[0];
+        let payload = InvitePayload {
+            v: 1, protocol: PROTOCOL_SIGNAL.to_string(), display_name: "Bob".to_string(),
+            mailbox_id: bob_route.mailbox_id.clone(), delivery_token: bob_route.delivery_token.clone(),
+            server_url: server_url.clone(), device_id: DEVICE_ID,
+            identity_public_b64: STANDARD_NO_PAD.encode(&bob.blob.public_key),
+            registration_id: bob.blob.registration_id as u32,
+            signed_prekey_id: bob.blob.signed_prekey_id,
+            signed_prekey_public_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_public),
+            signed_prekey_signature_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_signature),
+            opk_id: Some(bob_opk.id), opk_public_b64: Some(STANDARD_NO_PAD.encode(&bob_opk.public_key)),
+            kyber_prekey_id: Some(bob_kyber.id), kyber_prekey_public_b64: Some(bob_kyber.public_b64.clone()),
+            kyber_prekey_signature_b64: Some(bob_kyber.signature_b64.clone()), created_at_ms: now_ms(),
+        };
+        let bob_contact = contact_from_payload(payload, &alice.blob.public_key).unwrap();
+        let alice_route = new_local_route(server_url.clone(), contact_route_scope(&bob_contact.id), None).unwrap();
+        let (cert, trust_root_b64) = mint_cert(&alice_route.sealed_sender_cert_public_b64, &alice_route.mailbox_id);
+
+        let mut encrypted = signal_protocol_engine::encrypt_for_contact(
+            &alice.blob, &alice_material, &bob_contact, &alice_route, &alice_route,
+            &mut alice_store, "text", "secret", "m", now_ms(), &cert, false, None,
+        ).await.unwrap();
+        // Corrupt the ciphertext.
+        let last = encrypted.sealed_sender.len() - 1;
+        encrypted.sealed_sender[last] ^= 0x01;
+
+        let result = signal_protocol_engine::decrypt_sealed_sender_message(
+            &bob.blob, &bob_material, &mut bob_store, &bob_route, "srv_test",
+            &trust_root_b64, &encrypted.sealed_sender,
+        ).await;
+        assert!(result.is_err(), "a tampered sealed-sender message must not decrypt");
+    }
+}
