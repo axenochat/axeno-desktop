@@ -394,6 +394,13 @@ pub async fn disconnect_all_staggered(app: &AppHandle, state: &TransportState) {
     let _ = app.emit("axeno-shutdown-progress", ShutdownProgress { closed: 0, total });
     if total == 0 { return; }
 
+    // Staggering only hides which mailboxes belong to one user when there are at
+    // least two of them dropping together. With a single connection there is
+    // nothing to decorrelate it against, so a random close delay would just stall
+    // quit for no privacy gain — close it immediately (mirrors the connect side's
+    // `routes.len() >= 2` guard in messaging `connect_all`).
+    let stagger = total >= 2;
+
     let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut handles = Vec::new();
     for id in ids {
@@ -401,7 +408,7 @@ pub async fn disconnect_all_staggered(app: &AppHandle, state: &TransportState) {
         let app = app.clone();
         let closed = closed.clone();
         handles.push(tokio::spawn(async move {
-            sleep(random_stagger_delay()).await;
+            if stagger { sleep(random_stagger_delay()).await; }
             let _ = disconnect_server(&state, id).await;
             let n = closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let _ = app.emit("axeno-shutdown-progress", ShutdownProgress { closed: n, total });

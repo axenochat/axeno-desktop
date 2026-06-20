@@ -2602,7 +2602,14 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
     //
     // Pre-compute all delays so we can return the actual max to the frontend for
     // an accurate countdown (rather than always showing the theoretical max).
-    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() {
+    //
+    // Staggering only buys unlinkability when there are at least two mailboxes to
+    // spread apart: the whole point is to stop a logging relay grouping several
+    // mailboxes that appear together at unlock. With a single route (e.g. just one
+    // contact) there is nothing to decorrelate it against, so jitter would only
+    // delay the lone connection for no privacy gain — connect it immediately, the
+    // same as when the user has turned the obfuscation off.
+    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() && routes.len() >= 2 {
         routes.iter().map(|_| jittered_connect_delay()).collect()
     } else {
         routes.iter().map(|_| std::time::Duration::ZERO).collect()
