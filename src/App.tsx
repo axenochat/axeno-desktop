@@ -119,6 +119,10 @@ export default function App() {
   const [codeWarning, setCodeWarning] = useState<{ codeIds: string[] } | null>(null);
   const [isDeletingCodes, setIsDeletingCodes] = useState(false);
   const [showVerify, setShowVerify] = useState(false);
+  // A link the user clicked in a message, awaiting confirmation. Opening it
+  // leaves Tor, so we always confirm (and warn) before handing it to the OS.
+  const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem("axeno.settings.v1", JSON.stringify(sanitizeSettingsForStorage(settings))); } catch {}
@@ -690,7 +694,7 @@ export default function App() {
       <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
 
       {active ? (
-        <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />
+        <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onOpenVerify={() => setShowVerify(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} onOpenLink={(url) => { setLinkCopied(false); setLinkPrompt(url); }} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />
       ) : (
         <main className="chat-view empty-chat">Generate a connection code or add a contact to start messaging.</main>
       )}
@@ -699,6 +703,43 @@ export default function App() {
       {showAddContact && <AddContact onClose={() => setShowAddContact(false)} onAdded={handleAddedContact} />}
       {showChatSettings && active && <ChatSettings contact={active} onClose={() => setShowChatSettings(false)} onOpenVerify={() => { setShowChatSettings(false); setShowVerify(true); }} onMigrateRelay={(code) => migrateContactRelay(active.id, code)} />}
       {showVerify && active && <VerifyIdentity contact={active} onClose={() => setShowVerify(false)} onContactUpdated={(updated) => setContacts(prev => prev.map(c => c.id === updated.id ? updated : c))} />}
+
+      {linkPrompt && (
+        <>
+          <div className="context-menu-backdrop" onClick={() => setLinkPrompt(null)} />
+          <div className="code-warning-modal">
+            <div className="code-warning-icon">🔗</div>
+            <h3 className="code-warning-title">Open this link outside Axeno?</h3>
+            <p className="code-warning-body link-warning-url">{linkPrompt}</p>
+            <p className="code-warning-note">
+              Opening a link launches your normal browser, which does <strong>not</strong> go
+              through Tor. The site — and anyone watching it — can see your real IP address.
+              Only open links from people you trust.
+            </p>
+            <div className="code-warning-actions">
+              <button
+                className="btn btn-secondary"
+                onClick={async () => {
+                  try { await navigator.clipboard.writeText(linkPrompt); setLinkCopied(true); } catch {}
+                }}
+              >
+                {linkCopied ? "Copied" : "Copy link"}
+              </button>
+              <button className="btn btn-secondary" onClick={() => setLinkPrompt(null)}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                onClick={async () => {
+                  const url = linkPrompt;
+                  setLinkPrompt(null);
+                  try { await invoke("open_external_url", { url }); } catch { /* opener refused or failed */ }
+                }}
+              >
+                Open anyway
+              </button>
+            </div>
+          </div>
+        </>
+      )}
 
       {codeWarning && (
         <>

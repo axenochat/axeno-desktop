@@ -493,6 +493,36 @@ async fn tor_proxy_url(state: State<'_, AppTorState>) -> Result<Option<String>, 
     Ok((*state.socks_port.lock().await).map(|p| format!("socks5h://127.0.0.1:{p}")))
 }
 
+/// Open a peer-supplied link in the OS default browser, after the frontend has
+/// shown its deanonymisation warning and the user confirmed.
+///
+/// A link in a message is author-controlled and opening it leaves Tor, so this is
+/// deliberately strict: only `http(s)` URLs, no whitespace or control characters,
+/// bounded length. The URL is handed to the platform opener as a single argv
+/// element (never a shell string), so it cannot inject a command; requiring an
+/// `http(s)://` prefix also blocks dangerous schemes (`file:`, `javascript:`) and
+/// stops a leading `-` from being read as a flag. On Windows `FileProtocolHandler`
+/// takes the URL as one argument, avoiding `cmd.exe` re-parsing.
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) links can be opened".into());
+    }
+    if url.len() > 2048 || url.contains(|c: char| c.is_control() || c.is_whitespace()) {
+        return Err("refusing to open a malformed URL".into());
+    }
+    #[cfg(target_os = "linux")]
+    let mut cmd = { let mut c = std::process::Command::new("xdg-open"); c.arg(&url); c };
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = std::process::Command::new("open"); c.arg(&url); c };
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = std::process::Command::new("rundll32.exe"); c.arg("url.dll,FileProtocolHandler").arg(&url); c };
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let mut cmd: std::process::Command = return Err("opening links is not supported on this platform".into());
+    cmd.spawn().map_err(|e| format!("could not open link: {e}"))?;
+    Ok(())
+}
+
 
 // --------------------------------------------------------------------------
 // File dialog commands (Rust-owned)
@@ -914,16 +944,6 @@ async fn messaging_migrate_contact_with_code(
     messaging::migrate_contact_with_code(app, &session, transport_state.inner(), tor_state.client.clone(), contact_id, code).await
 }
 
-#[tauri::command]
-async fn messaging_update_contact_server(
-    app: AppHandle,
-    session: State<'_, AppSessionState>,
-    contact_id: String,
-    server_url: String,
-) -> Result<messaging::StoredContact, String> {
-    messaging::update_contact_server(app, &session, contact_id, server_url).await
-}
-
 // --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
@@ -969,6 +989,7 @@ pub fn run() {
             change_password,
             bootstrap_tor,
             tor_proxy_url,
+            open_external_url,
             pick_file_for_send,
             pick_save_path,
             messaging_load_private_server_settings,
@@ -992,7 +1013,6 @@ pub fn run() {
             messaging_verify_contact_with_code,
             messaging_mark_contact_read,
             messaging_migrate_contact_with_code,
-            messaging_update_contact_server,
             transport_connect_server,
             transport_disconnect_server,
             transport_disconnect_all_staggered,

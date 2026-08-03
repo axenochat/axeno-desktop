@@ -105,3 +105,29 @@ export function unreadCount(messages: Message[], lastReadAt: number | null): num
   if (lastReadAt === null) return inbound.length;
   return inbound.filter(m => unreadComparisonTime(m) > lastReadAt).length;
 }
+
+export interface TextSegment { type: "text" | "link"; value: string; }
+
+// Split message text into plain-text and http(s) link segments so the chat view
+// can render links as (deliberately click-gated) anchors without ever injecting
+// HTML. The trailing-punctuation trim keeps a period/paren after a URL out of the
+// link. Only http/https is matched; the opener command re-validates the scheme.
+const URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
+export function linkifySegments(text: string): TextSegment[] {
+  const segments: TextSegment[] = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(URL_RE)) {
+    const start = match.index ?? 0;
+    let url = match[0];
+    // Don't swallow trailing sentence punctuation into the link.
+    const trailing = url.match(/[.,:;!?)\]}'"]+$/);
+    if (trailing) url = url.slice(0, url.length - trailing[0].length);
+    if (!url) continue;
+    if (start > lastIndex) segments.push({ type: "text", value: text.slice(lastIndex, start) });
+    segments.push({ type: "link", value: url });
+    lastIndex = start + url.length;
+  }
+  if (lastIndex < text.length) segments.push({ type: "text", value: text.slice(lastIndex) });
+  if (segments.length === 0) segments.push({ type: "text", value: text });
+  return segments;
+}

@@ -37,7 +37,6 @@ const STORE_FILE: &str = "messages.store";
 /// It is not a default relay: clients must add their own relay explicitly.
 const LOOPBACK_RELAY_URL: &str = "ws://127.0.0.1:8787/ws";
 const PROTOCOL_SIGNAL: &str = "axeno_signal_v1";
-const ENVELOPE_TYPE_SIGNAL: &str = "axeno_signal_v1";
 const ENVELOPE_TYPE_SEALED_SIGNAL: &str = "axeno_sealed_signal_v1";
 const DEVICE_ID: u32 = 1;
 /// How long a connection code stays redeemable. Bounded on the relay by
@@ -184,6 +183,14 @@ pub struct FileAttachment {
 const FILE_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
 /// AEAD tag length added to every encrypted chunk (ChaCha20-Poly1305).
 const FILE_CHUNK_TAG_BYTES: u64 = 16;
+/// Absolute ceiling on an incoming file's declared plaintext size, independent of
+/// any relay's per-file cap. A file lives on the *sender's* relay, which a
+/// malicious contact may control, so we cannot rely on that relay to bound the
+/// size. This is the recipient-side safety net that keeps a download from filling
+/// the disk; combined with `file_pointer_is_sane` (declared chunk count must match
+/// size) and the running `written > size` guard in `download_file`, the bytes a
+/// download can ever write are bounded by the declared, sanity-checked `size`.
+const MAX_INCOMING_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The wire pointer for a "file" payload: everything the recipient needs to
 /// fetch and decrypt the blob, carried inside the E2E-encrypted Signal body.
@@ -2920,6 +2927,24 @@ fn file_cipher(key_b64: &str) -> Result<ChaCha20Poly1305, String> {
     Ok(ChaCha20Poly1305::new(Key::from_slice(&key)))
 }
 
+/// Validate a peer-supplied file pointer's declared shape before we trust it
+/// enough to download. The `size`, `chunk_size`, and `total_chunks` are all
+/// author-controlled and the blob sits on the sender's (possibly hostile) relay,
+/// so without this a small `size` could smuggle a huge `total_chunks` and stream
+/// far more bytes to disk than declared. Requiring the chunk count to be exactly
+/// what `size`/`chunk_size` imply — plus a bounded chunk size and an absolute size
+/// ceiling — closes that amplification. `download_file` additionally aborts the
+/// moment the bytes written exceed `size`, so a lying relay cannot overrun either.
+fn file_pointer_is_sane(p: &FilePointer) -> bool {
+    let chunk_size = p.chunk_size as u64;
+    p.size > 0
+        && p.size <= MAX_INCOMING_FILE_BYTES
+        && chunk_size > 0
+        && chunk_size <= FILE_CHUNK_PLAINTEXT_BYTES as u64
+        && p.total_chunks > 0
+        && (p.total_chunks as u64) == p.size.div_ceil(chunk_size)
+}
+
 /// Deterministic 96-bit nonce for chunk `index`. The file key is random and used
 /// for exactly one transfer, so a per-index nonce never repeats a (key, nonce)
 /// pair. Layout: four zero bytes followed by the little-endian chunk index.
@@ -3163,6 +3188,16 @@ pub async fn download_file(
                 return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file chunk failed to decrypt (wrong key or corrupted)".to_string()));
             }
         };
+        // The blob sits on the sender's relay, which a hostile contact may control,
+        // so a chunk can decrypt fine yet carry more bytes than declared. Bound the
+        // write to the sanity-checked declared size (and per-chunk cap) so a lying
+        // relay can never overrun the disk beyond `attachment.size`.
+        if plain.len() as u64 > attachment.chunk_size as u64
+            || written.saturating_add(plain.len() as u64) > attachment.size
+        {
+            let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file transfer sent more data than it declared".to_string()));
+        }
         if let Err(e) = file.write_all(&plain) {
             let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
             return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, format!("could not write download: {e}")));
@@ -3202,7 +3237,11 @@ pub async fn handle_incoming_envelope(
     envelope: transport::StoredEnvelope,
 ) -> Result<(), String> {
     let (store_key, legacy_store_key) = store_keys(session).await?;
-    if envelope.envelope_type != ENVELOPE_TYPE_SEALED_SIGNAL && envelope.envelope_type != ENVELOPE_TYPE_SIGNAL { return Ok(()); }
+    // Only sealed-sender envelopes are a real message path; every send produces
+    // this type. Anything else (including the retired plaintext `axeno_signal_v1`
+    // type, which nothing has ever produced and which would only fail the sealed
+    // parser below) is acked-and-ignored rather than given reach into decrypt.
+    if envelope.envelope_type != ENVELOPE_TYPE_SEALED_SIGNAL { return Ok(()); }
 
     let envelope_key = envelope.id.to_string();
     let already_seen = {
@@ -3381,7 +3420,7 @@ pub async fn handle_incoming_envelope(
         // (we deliberately do not auto-fetch the blob — the recipient decides when
         // to spend the bandwidth). The bubble renders from the attachment.
         match serde_json::from_str::<FilePointer>(&decrypted.message.body) {
-            Ok(p) if p.v == 1 && p.total_chunks > 0 => {
+            Ok(p) if p.v == 1 && file_pointer_is_sane(&p) => {
                 let attachment = FileAttachment {
                     transfer_id: p.transfer_id,
                     key_b64: p.key_b64,
@@ -3768,10 +3807,6 @@ pub async fn migrate_contact_with_code(
         route_to_connect.delivery_token.clone(),
     ).await;
     Ok(out)
-}
-
-pub async fn update_contact_server(_app: AppHandle, _session: &AppSessionState, _contact_id: String, _server_url: String) -> Result<StoredContact, String> {
-    Err("changing a contact relay without a fresh connection code is unsafe; use relay migration with a fresh code".into())
 }
 
 mod signal_protocol_engine {

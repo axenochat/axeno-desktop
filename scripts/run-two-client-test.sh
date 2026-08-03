@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Axeno local two-client test harness.
 #
-# Run it from the desktop client repo (this script lives in axeno-desktop/). It
+# This script lives in axeno-desktop/scripts/ and can be run from anywhere. It
 # spins up two Tauri dev clients side by side so you can pair them and message.
 # Both clients use the official relay that a fresh install defaults to, so no
 # local relay is started.
@@ -29,10 +29,11 @@ for arg in "$@"; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"        # axeno-desktop (this script lives in scripts/)
+WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"    # axeno (parent that holds both repos)
 
-CLIENT_A="$SCRIPT_DIR"
-CLIENT_B="$REPO_ROOT/axeno-desktop2"
+CLIENT_A="$REPO_ROOT"
+CLIENT_B="$WORKSPACE_ROOT/axeno-desktop2"
 
 PORT_A="1420"
 PORT_B="1421"

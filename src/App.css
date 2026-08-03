@@ -122,6 +122,19 @@
   margin: 0 0 18px;
 }
 
+.link-warning-url {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-bright);
+  word-break: break-all;
+  background: var(--bg-input, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
 .code-warning-actions {
   display: flex;
   gap: 10px;

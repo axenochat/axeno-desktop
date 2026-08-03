@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Contact, Message, FileProgress } from "../../types";
-import { contactDisplayName, contactInitials, formatClockTime, formatDayDivider, formatFileSize, isSameDay, isSameMinute } from "../../utils";
-import { IconDots, IconArrowUp, IconPaperclip, IconDownload, IconFile } from "../icons";
+import { contactDisplayName, contactInitials, formatClockTime, formatDayDivider, formatFileSize, isSameDay, isSameMinute, linkifySegments } from "../../utils";
+import { IconDots, IconArrowUp, IconPaperclip, IconDownload, IconFile, IconShield, IconChevronDown } from "../icons";
 import "./ChatView.css";
 
 interface Props {
@@ -9,12 +9,22 @@ interface Props {
   messages: Message[];
   fileProgress: Record<string, FileProgress>;
   onOpenChatSettings: () => void;
+  onOpenVerify: () => void;
   onSendMessage: (text: string) => Promise<void>;
   onSendFile: () => Promise<void>;
   onDownloadFile: (msg: Message) => Promise<void>;
+  onOpenLink: (url: string) => void;
   sendOnEnter: boolean;
   messageTextSize: "small" | "medium" | "large";
 }
+
+// A small, dependency-free palette of common emoji for the composer picker.
+const EMOJI = [
+  "😀", "😂", "🙂", "😉", "😍", "😎", "🤔", "😅", "😭", "😡",
+  "👍", "👎", "🙏", "👋", "💪", "🔥", "🎉", "✅", "❌", "⚠️",
+  "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "💔", "⭐", "✨",
+  "📎", "📁", "🔒", "🔑", "🕵️", "👀", "💬", "⏰", "☕", "🍺",
+];
 
 function messageStatusLabel(status?: string): string {
   switch (status) {
@@ -26,10 +36,41 @@ function messageStatusLabel(status?: string): string {
   }
 }
 
-export default function ChatView({ contact, messages, fileProgress, onOpenChatSettings, onSendMessage, onSendFile, onDownloadFile, sendOnEnter, messageTextSize }: Props) {
+// Render a message body as plain text with clickable http(s) links. Links never
+// navigate directly; they call onOpenLink, which the app gates behind a
+// deanonymisation warning before handing the URL to the OS opener.
+function MessageText({ text, onOpenLink }: { text: string; onOpenLink: (url: string) => void }) {
+  const segments = linkifySegments(text);
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.type === "link" ? (
+          <span
+            key={i}
+            className="msg-link"
+            role="link"
+            tabIndex={0}
+            title={seg.value}
+            onClick={(e) => { e.stopPropagation(); onOpenLink(seg.value); }}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onOpenLink(seg.value); } }}
+          >
+            {seg.value}
+          </span>
+        ) : (
+          <Fragment key={i}>{seg.value}</Fragment>
+        )
+      )}
+    </>
+  );
+}
+
+export default function ChatView({ contact, messages, fileProgress, onOpenChatSettings, onOpenVerify, onSendMessage, onSendFile, onDownloadFile, onOpenLink, sendOnEnter, messageTextSize }: Props) {
   const [input, setInput] = useState("");
   const [sendError, setSendError] = useState("");
+  const [showEmoji, setShowEmoji] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   // Whether the view is pinned to the latest message. True while the user is at
   // (or near) the bottom; set false once they scroll up to read history so an
   // incoming message doesn't yank them back down.
@@ -39,7 +80,17 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
     const el = scrollRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distanceFromBottom < 80;
+    const near = distanceFromBottom < 80;
+    stickToBottomRef.current = near;
+    setAtBottom(near);
+  };
+
+  const scrollToBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    stickToBottomRef.current = true;
+    setAtBottom(true);
   };
 
   // Jump to the bottom whenever a different conversation is opened.
@@ -48,6 +99,8 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
     if (!el) return;
     el.scrollTop = el.scrollHeight;
     stickToBottomRef.current = true;
+    setAtBottom(true);
+    setShowEmoji(false);
   }, [contact.id]);
 
   // Keep the newest message visible as messages arrive. We always follow our own
@@ -59,14 +112,27 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
     const lastMine = messages[messages.length - 1]?.mine ?? false;
     if (stickToBottomRef.current || lastMine) {
       el.scrollTop = el.scrollHeight;
+      setAtBottom(true);
     }
   }, [messages]);
+
+  // Grow the composer with its content, up to a cap, then let it scroll.
+  const autosize = () => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
+  useEffect(autosize, [input]);
 
   const send = () => {
     const text = input.trim();
     if (!text) return;
     setSendError("");
     setInput("");
+    setShowEmoji(false);
+    // Reset the textarea height after clearing.
+    requestAnimationFrame(autosize);
     // Fire-and-forget: each message gets its own optimistic bubble with a
     // per-message status, so an in-flight send must not block typing the next.
     onSendMessage(text).catch(e => {
@@ -88,6 +154,26 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
     });
   };
 
+  const insertEmoji = (emoji: string) => {
+    const el = inputRef.current;
+    if (el && typeof el.selectionStart === "number") {
+      const start = el.selectionStart;
+      const end = el.selectionEnd ?? start;
+      const next = input.slice(0, start) + emoji + input.slice(end);
+      setInput(next);
+      requestAnimationFrame(() => {
+        el.focus();
+        const pos = start + emoji.length;
+        el.setSelectionRange(pos, pos);
+      });
+    } else {
+      setInput(prev => prev + emoji);
+    }
+  };
+
+  const trust = contact.trustState ?? "unverified";
+  const showVerifyChip = trust !== "verified";
+
   return (
     <main className="chat-view">
       <header className="chat-header">
@@ -95,52 +181,79 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
         <div className="chat-header-info">
           <div className="chat-contact-id">{contactDisplayName(contact)}</div>
         </div>
+        {showVerifyChip && (
+          <button
+            className={`chat-verify-chip ${trust === "identity_changed_blocked" ? "danger" : ""}`}
+            onClick={onOpenVerify}
+            title={trust === "identity_changed_blocked"
+              ? "This contact's identity key changed. Re-verify before trusting."
+              : "You haven't verified this contact's safety number yet."}
+          >
+            <IconShield />
+            <span>{trust === "identity_changed_blocked" ? "Identity changed" : "Verify"}</span>
+          </button>
+        )}
         <button className="chat-icon-button" onClick={onOpenChatSettings} aria-label="Chat settings">
           <IconDots />
         </button>
       </header>
 
-      <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
-        {messages.map((msg, i) => {
-          const prev = messages[i - 1];
-          const next = messages[i + 1];
-          const isSequenceStart = !prev || prev.mine !== msg.mine;
-          const showDivider = !prev || !isSameDay(prev.timestamp, msg.timestamp);
-          // Clump a run of same-sender messages from the same minute under one
-          // trailing timestamp; always surface a failed send.
-          const endOfClump = !next || next.mine !== msg.mine || !isSameMinute(msg.timestamp, next.timestamp);
-          const statusLabel = msg.mine ? messageStatusLabel(msg.status) : "";
-          const showMeta = endOfClump || msg.status === "send_failed";
-          return (
-            <Fragment key={msg.id}>
-              {showDivider && (
-                <div className="date-divider">
-                  <span className="date-line"></span>
-                  <span className="date-label">{formatDayDivider(msg.timestamp)}</span>
-                  <span className="date-line"></span>
-                </div>
-              )}
-              <div
-                className={`message-row ${msg.mine ? "mine" : "theirs"} ${isSequenceStart && prev && !showDivider ? "sequence-start" : ""}`}
-              >
-                <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}${msg.attachment ? " bubble-file" : ""}`}>
-                  {msg.attachment
-                    ? <FileBubble msg={msg} progress={fileProgress[msg.id]} onDownload={() => download(msg)} />
-                    : msg.text}
-                </div>
-                {showMeta && (
-                  <div className="message-time">
-                    {formatClockTime(msg.timestamp)}
-                    {statusLabel && <span className={`message-status status-${msg.status}`}> · {statusLabel}</span>}
+      <div className="chat-messages-wrap">
+        <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
+          {messages.map((msg, i) => {
+            const prev = messages[i - 1];
+            const next = messages[i + 1];
+            const isSequenceStart = !prev || prev.mine !== msg.mine;
+            const showDivider = !prev || !isSameDay(prev.timestamp, msg.timestamp);
+            // Clump a run of same-sender messages from the same minute under one
+            // trailing timestamp; always surface a failed send.
+            const endOfClump = !next || next.mine !== msg.mine || !isSameMinute(msg.timestamp, next.timestamp);
+            const statusLabel = msg.mine ? messageStatusLabel(msg.status) : "";
+            const showMeta = endOfClump || msg.status === "send_failed";
+            return (
+              <Fragment key={msg.id}>
+                {showDivider && (
+                  <div className="date-divider">
+                    <span className="date-line"></span>
+                    <span className="date-label">{formatDayDivider(msg.timestamp)}</span>
+                    <span className="date-line"></span>
                   </div>
                 )}
-              </div>
-            </Fragment>
-          );
-        })}
+                <div
+                  className={`message-row ${msg.mine ? "mine" : "theirs"} ${isSequenceStart && prev && !showDivider ? "sequence-start" : ""}`}
+                >
+                  <div className={`bubble ${msg.mine ? "bubble-mine" : "bubble-theirs"} text-${messageTextSize}${msg.attachment ? " bubble-file" : ""}`}>
+                    {msg.attachment
+                      ? <FileBubble msg={msg} progress={fileProgress[msg.id]} onDownload={() => download(msg)} />
+                      : <MessageText text={msg.text} onOpenLink={onOpenLink} />}
+                  </div>
+                  {showMeta && (
+                    <div className="message-time">
+                      {formatClockTime(msg.timestamp)}
+                      {statusLabel && <span className={`message-status status-${msg.status}`}> · {statusLabel}</span>}
+                    </div>
+                  )}
+                </div>
+              </Fragment>
+            );
+          })}
+        </div>
+
+        {!atBottom && (
+          <button className="chat-jump-latest" onClick={scrollToBottom} aria-label="Jump to latest messages" title="Jump to latest">
+            <IconChevronDown />
+          </button>
+        )}
       </div>
 
       <div className="chat-input-wrap">
+        {showEmoji && (
+          <div className="emoji-panel" role="listbox" aria-label="Emoji">
+            {EMOJI.map(e => (
+              <button key={e} className="emoji-item" onClick={() => insertEmoji(e)} tabIndex={0}>{e}</button>
+            ))}
+          </div>
+        )}
         <div className="chat-input-row">
           <button
             className="chat-input-attach"
@@ -150,16 +263,27 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
           >
             <IconPaperclip />
           </button>
-          <input
-            type="text"
+          <button
+            className={`chat-input-emoji ${showEmoji ? "active" : ""}`}
+            aria-label="Insert emoji"
+            title="Emoji"
+            onClick={() => setShowEmoji(s => !s)}
+          >
+            <span aria-hidden>🙂</span>
+          </button>
+          <textarea
+            ref={inputRef}
             value={input}
+            rows={1}
             onChange={e => setInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && (sendOnEnter ? !e.shiftKey : e.ctrlKey)) { e.preventDefault(); send(); } }}
+            onKeyDown={e => {
+              if (e.key === "Enter" && (sendOnEnter ? !e.shiftKey : e.ctrlKey)) { e.preventDefault(); send(); }
+            }}
             placeholder="Message"
             className="chat-input"
           />
           <button
-            className={`chat-send ${input.length > 0 ? "active" : ""}`}
+            className={`chat-send ${input.trim().length > 0 ? "active" : ""}`}
             aria-label="Send message"
             onClick={send}
             disabled={!input.trim()}

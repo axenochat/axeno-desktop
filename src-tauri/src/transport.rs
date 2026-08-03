@@ -1732,6 +1732,18 @@ mod tests {
     }
 
     #[test]
+    fn wire_constants_match_relay() {
+        // These are part of the wire contract shared with the relay (axeno-relay
+        // `config.rs`), a SEPARATE repository that hard-codes the same values.
+        // Pinning the literals here makes any drift fail CI and prompts the
+        // matching change on the relay in lockstep. See also
+        // `pow_hash_ok_matches_legacy_22_bit_check` for the PoW difficulty.
+        assert_eq!(POW_LEADING_ZERO_BITS, 22);
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_MIN_SUPPORTED, 4);
+    }
+
+    #[test]
     fn pow_hash_ok_matches_legacy_22_bit_check() {
         // The helper must accept exactly what the old hand-inlined test did at 22
         // bits: hash[0]==0 && hash[1]==0 && (hash[2] >> 2) == 0.
