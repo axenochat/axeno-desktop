@@ -61,6 +61,38 @@ function groupMessages(snapshot: MessagingSnapshot): Record<string, Message[]> {
   return result;
 }
 
+// Statuses for an outgoing message that is still being delivered. A message in
+// one of these states that the backend snapshot does not yet contain is an
+// in-flight optimistic bubble (the brief window before the backend persists it),
+// and must survive a snapshot refresh rather than vanish.
+const IN_FLIGHT_MINE_STATUSES = new Set(["relay_pending", "relay_queued", "send_failed"]);
+
+// Merge a fresh backend snapshot over the current UI state. The snapshot is
+// authoritative for every message id it contains, but a just-sent bubble can be
+// missing from it for a moment (a refresh, triggered by any inbound event, can
+// land between the optimistic add and the backend persisting the row). Preserving
+// those recent in-flight mine-messages is what stops a send from "disappearing".
+function mergeSnapshotMessages(
+  prev: Record<string, Message[]>,
+  snapshot: MessagingSnapshot,
+): Record<string, Message[]> {
+  const grouped = groupMessages(snapshot);
+  const now = Date.now();
+  Object.entries(prev).forEach(([contactId, msgs]) => {
+    const snapList = grouped[contactId] ?? [];
+    const snapIds = new Set(snapList.map(m => m.id));
+    const survivors = msgs.filter(m =>
+      m.mine &&
+      !snapIds.has(m.id) &&
+      IN_FLIGHT_MINE_STATUSES.has(m.status ?? "") &&
+      now - m.timestamp < 5 * 60 * 1000,
+    );
+    if (survivors.length === 0) return;
+    grouped[contactId] = [...snapList, ...survivors].sort((a, b) => a.timestamp - b.timestamp);
+  });
+  return grouped;
+}
+
 export default function App() {
   const [appState, setAppState] = useState<"loading" | "onboarding" | "login" | "chat">("loading");
   const [torStatus, setTorStatus] = useState<TorStatus>("connecting");
@@ -80,6 +112,9 @@ export default function App() {
   const [activeContactId, setActiveContactId] = useState("");
   const activeContactIdRef = useRef("");
   const reconnectTimersRef = useRef<Record<string, number>>({});
+  // Debounce for the resend sweeper so a burst of route "ready" events collapses
+  // into a single retry pass.
+  const retryTimerRef = useRef<number | null>(null);
 
   // Non-blocking "syncing messages" indicator, driven by the backend's
   // authoritative `axeno-sync-status` event: it reports true while any relay
@@ -95,6 +130,12 @@ export default function App() {
   const [shuttingDown, setShuttingDown] = useState(false);
   const [shutdownProgress, setShutdownProgress] = useState<{ closed: number; total: number }>({ closed: 0, total: 0 });
   const shuttingDownRef = useRef(false);
+  // True while the app is locked (or being locked). Gates the auto-reconnect and
+  // tor-connected handlers so they don't reopen relay sockets behind the lock
+  // screen, and prevents a second lock while one is in progress.
+  const lockedRef = useRef(false);
+  // Timestamp of the last user activity, used by the idle auto-lock poller.
+  const lastActivityRef = useRef(Date.now());
   // Startup counterpart to the shutdown overlay: while the backend staggers each
   // route's connection across the jitter window, show a non-blocking banner that
   // counts the window down so the wait is visible instead of looking stalled.
@@ -193,18 +234,56 @@ export default function App() {
     }, 1000);
   }, []);
 
-  const loadMessaging = useCallback(async () => {
+  // Pull the latest contacts/messages from the backend into the UI. This is a
+  // pure read: it never (re)connects routes or shows the connect-stagger banner,
+  // so it is safe to call on every inbound message and other frequent refreshes.
+  const refreshSnapshot = useCallback(async () => {
     const snap = await invoke<MessagingSnapshot>("messaging_snapshot");
     const nextContacts = snap.contacts.map(contactFromBackend);
     setContacts(nextContacts);
-    setMessages(groupMessages(snap));
+    setMessages(prev => mergeSnapshotMessages(prev, snap));
     setActiveContactId(prev => prev || nextContacts[0]?.id || "");
-    // connect_all triggers the relay's queued-message replay; the backend emits
-    // axeno-sync-status while that backlog is in flight. It returns the actual
-    // max jitter ms chosen for this run so the countdown shows the real window.
+    return nextContacts;
+  }, []);
+
+  // Establish/keep-alive all route connections. connect_all is idempotent —
+  // healthy routes are reused, dead ones rebuilt — and it triggers the relay's
+  // queued-message replay (the backend emits axeno-sync-status while that backlog
+  // is in flight). Crucially it keeps the sender routes warm so replies send
+  // instantly instead of building a Tor circuit on demand.
+  //
+  // `showBanner` controls only the cosmetic stagger countdown. Show it at genuine
+  // (re)connect moments — login, onboarding, add/migrate contact — but NOT on the
+  // keep-alive after an inbound message, which would flash the banner on every
+  // received message. connect_all returns the actual max jitter ms for this run
+  // so the countdown reflects the real window.
+  const connectAll = useCallback(async (showBanner: boolean) => {
     const maxJitterMs = await invoke<number>("messaging_connect_all").catch(() => 0);
-    if (nextContacts.length > 0) startConnectStaggerIndicator(maxJitterMs);
+    if (showBanner) startConnectStaggerIndicator(maxJitterMs);
   }, [startConnectStaggerIndicator]);
+
+  // Drain outgoing messages that never reached the relay (stalled relay_pending or
+  // send_failed). The backend resend is idempotent and dedup-safe; this just pokes
+  // it at the right moments (a route became ready, periodic backstop) and then
+  // pulls the refreshed statuses into the UI. Debounced so a burst of "ready"
+  // events triggers one pass.
+  const retryPendingSends = useCallback(() => {
+    if (lockedRef.current) return;
+    if (retryTimerRef.current !== null) return;
+    retryTimerRef.current = window.setTimeout(async () => {
+      retryTimerRef.current = null;
+      try {
+        await invoke("messaging_retry_pending");
+        await refreshSnapshot();
+      } catch { /* best effort */ }
+    }, 2000);
+  }, [refreshSnapshot]);
+
+  // Initial session load: refresh the snapshot, then connect all routes (banner).
+  const loadMessaging = useCallback(async () => {
+    const nextContacts = await refreshSnapshot();
+    await connectAll(nextContacts.length > 0);
+  }, [refreshSnapshot, connectAll]);
 
   const loadPrivateServerSettings = useCallback(async () => {
     const persisted = await invoke<BackendPrivateServerSettings>("messaging_load_private_server_settings");
@@ -234,7 +313,82 @@ export default function App() {
     setContacts(prev => prev.map(c => c.id === contactId ? next : c));
   }, []);
 
+  // Lock the app: drop the decrypted vault + message-store key from Rust memory,
+  // tear down relay sockets (staggered, in the background, so a logging relay
+  // can't see them all drop at once), wipe in-memory UI state, and return to the
+  // unlock screen. Idempotent and guarded so concurrent triggers (button + idle
+  // + blur) collapse into one.
+  const lockApp = useCallback(async () => {
+    if (lockedRef.current) return;
+    lockedRef.current = true;
+    setShowSettings(false);
+    setShowAddContact(false);
+    setShowChatSettings(false);
+    setShowVerify(false);
+    setCodeWarning(null);
+    // Best-effort socket teardown; never block the lock on it.
+    invoke("transport_disconnect_all_staggered").catch(() => {});
+    try { await invoke("lock_identity"); } catch { /* lock the UI regardless */ }
+    setContacts([]);
+    setMessages({});
+    setFileProgress({});
+    setActiveContactId("");
+    activeContactIdRef.current = "";
+    setDisplayName("");
+    setServerSettingsLoaded(false);
+    setSyncing(false);
+    setConnectCountdown(null);
+    setLoginError("");
+    setAppState("login");
+  }, []);
+
   useEffect(() => () => { if (syncCapTimerRef.current) window.clearTimeout(syncCapTimerRef.current); }, []);
+
+  // Auto-lock on inactivity and (optionally) on window blur/hide. Only armed
+  // while unlocked and in the chat view.
+  //
+  // Activity is recorded as a timestamp (`lastActivityRef`); a separate interval
+  // checks how long it has been since the last activity and locks once the
+  // configured window has elapsed. This is deliberately NOT a single
+  // reset-on-activity setTimeout: stray pointer events (the per-second connect
+  // countdown or the auto-scrolling message list repainting under a stationary
+  // cursor can emit them) would keep clearing/recreating that timeout so it never
+  // fires. Stamping a timestamp + polling is immune to that and to effect churn.
+  useEffect(() => {
+    if (appState !== "chat") return;
+    const { autoLockMinutes, lockOnHide } = settings;
+    if (autoLockMinutes <= 0 && !lockOnHide) return;
+
+    let intervalId: number | null = null;
+    const markActivity = () => { lastActivityRef.current = Date.now(); };
+    const activityEvents: (keyof WindowEventMap)[] = ["mousedown", "keydown", "wheel", "touchstart", "mousemove"];
+
+    if (autoLockMinutes > 0) {
+      const timeoutMs = autoLockMinutes * 60_000;
+      lastActivityRef.current = Date.now();
+      activityEvents.forEach((ev) => window.addEventListener(ev, markActivity, { passive: true }));
+      // Check several times within the window (capped) so the lock is reasonably
+      // prompt without polling needlessly often.
+      const checkMs = Math.min(Math.max(Math.floor(timeoutMs / 6), 1_000), 15_000);
+      intervalId = window.setInterval(() => {
+        if (Date.now() - lastActivityRef.current >= timeoutMs) void lockApp();
+      }, checkMs);
+    }
+
+    const onVisibility = () => { if (document.visibilityState === "hidden") void lockApp(); };
+    const onBlur = () => { void lockApp(); };
+    if (lockOnHide) {
+      document.addEventListener("visibilitychange", onVisibility);
+      window.addEventListener("blur", onBlur);
+    }
+
+    return () => {
+      if (intervalId !== null) window.clearInterval(intervalId);
+      activityEvents.forEach((ev) => window.removeEventListener(ev, markActivity));
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [appState, settings.autoLockMinutes, settings.lockOnHide, lockApp]);
 
   const activeContactIdForUi = activeContactId || contacts[0]?.id || "";
 
@@ -265,7 +419,7 @@ export default function App() {
     const unlistenTor = listen<TorStatusEvent>("tor-status", (event) => {
       setTorStatus(event.payload.status);
       setTorError(event.payload.reason ?? "");
-      if (event.payload.status === "connected") {
+      if (event.payload.status === "connected" && !lockedRef.current) {
         invoke("messaging_connect_all").catch(() => {});
       }
     });
@@ -275,9 +429,10 @@ export default function App() {
     });
 
     const unlistenServerStatus = listen<ServerStatusEvent>("axeno-server-status", (event) => {
-      // While quitting, the staggered teardown intentionally disconnects every
-      // socket; don't schedule auto-reconnects that would race the shutdown.
-      if (shuttingDownRef.current) return;
+      // While quitting or locked, sockets are intentionally torn down; don't
+      // schedule auto-reconnects that would race the shutdown or reopen them
+      // behind the lock screen.
+      if (shuttingDownRef.current || lockedRef.current) return;
       const { server_id: serverId, status } = event.payload;
       if (status === "ready" || status === "connected" || status === "connecting") {
         const existing = reconnectTimersRef.current[serverId];
@@ -285,6 +440,8 @@ export default function App() {
           window.clearTimeout(existing);
           delete reconnectTimersRef.current[serverId];
         }
+        // A route just came up: a good moment to flush any stalled outgoing sends.
+        if (status === "ready") retryPendingSends();
         return;
       }
       if (status !== "failed" && status !== "disconnected") return;
@@ -370,9 +527,13 @@ export default function App() {
         setActiveContactId(contactId);
       }
 
+      // Pull the authoritative snapshot, then keep routes warm so a reply sends
+      // instantly. Warm silently — no stagger banner — since this fires on every
+      // received message (showing it here was the spurious-banner bug).
       const refreshAfterRead = async () => {
         if (isOpenChat) await markContactRead(contactId).catch(() => {});
-        await loadMessaging().catch(() => {});
+        await refreshSnapshot().catch(() => {});
+        await connectAll(false).catch(() => {});
       };
       void refreshAfterRead();
     });
@@ -388,6 +549,10 @@ export default function App() {
     };
     init();
 
+    // Periodic backstop for the resend sweeper: even with no route-status churn,
+    // poke it every 30s so a stalled send eventually lands once a circuit is up.
+    const retryInterval = window.setInterval(() => retryPendingSends(), 30000);
+
     return () => {
       unlistenTor.then(f => f());
       unlistenSyncStatus.then(f => f());
@@ -398,12 +563,17 @@ export default function App() {
       unlistenMessage.then(f => f());
       Object.values(reconnectTimersRef.current).forEach(timer => window.clearTimeout(timer));
       reconnectTimersRef.current = {};
+      window.clearInterval(retryInterval);
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       if (connectCountdownTimerRef.current !== null) {
         window.clearInterval(connectCountdownTimerRef.current);
         connectCountdownTimerRef.current = null;
       }
     };
-  }, [loadMessaging, loadPrivateServerSettings, markContactRead, applySyncStatus]);
+  }, [refreshSnapshot, connectAll, loadPrivateServerSettings, markContactRead, applySyncStatus, retryPendingSends]);
 
   // Intercept the window close: hold it open, stagger-close the relay sockets so
   // a logging relay can't see all our mailboxes drop in one burst, then destroy
@@ -448,6 +618,8 @@ export default function App() {
       const res = await invoke<UnlockResponse>("unlock_identity", { passphrase });
       if (loginPasswordRef.current) loginPasswordRef.current.value = "";
       setLoginPasswordReady(false);
+      // Re-arm the session: clears the lock guard so reconnects resume.
+      lockedRef.current = false;
       setDisplayName(res.display_name);
       await loadMessaging();
       await loadPrivateServerSettings().catch(() => setServerSettingsLoaded(true));
@@ -476,10 +648,14 @@ export default function App() {
   };
 
   const sendMessage = async (contactId: string, text: string) => {
-    // Optimistic: show bubble immediately with "sending" status
-    const optimisticId = `pending_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    // Share one id between the optimistic bubble, the backend store row, and the
+    // wire message. Previously the optimistic id was a throwaway `pending_…` that
+    // could never match the backend's minted id, so if a snapshot refresh replaced
+    // the list mid-send the bubble was orphaned and lost. A stable id makes the
+    // bubble reconcilable and lets the backend persist/resend under the same id.
+    const messageId = (crypto as Crypto).randomUUID();
     const optimisticMsg: Message = {
-      id: optimisticId,
+      id: messageId,
       text,
       mine: true,
       timestamp: Date.now(),
@@ -488,18 +664,20 @@ export default function App() {
     setMessages(prev => ({ ...prev, [contactId]: [...(prev[contactId] ?? []), optimisticMsg] }));
 
     try {
-      const res = await invoke<SendMessageResponse>("messaging_send_text_message", { contactId, text });
+      const res = await invoke<SendMessageResponse>("messaging_send_text_message", { contactId, text, messageId });
       const msg = messageFromBackend(res.message);
       // Replace optimistic message with real one from backend
       setMessages(prev => {
         const existing = prev[contactId] ?? [];
-        return { ...prev, [contactId]: existing.map(m => m.id === optimisticId ? msg : m) };
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId ? msg : m) };
       });
     } catch (e) {
-      // Mark optimistic message as failed
+      // The send threw, but the row was already persisted as relay_pending and the
+      // resend sweeper will keep retrying it; show it as failed for now so the user
+      // sees a truthful state rather than the bubble vanishing.
       setMessages(prev => {
         const existing = prev[contactId] ?? [];
-        return { ...prev, [contactId]: existing.map(m => m.id === optimisticId ? { ...m, status: "send_failed" } : m) };
+        return { ...prev, [contactId]: existing.map(m => m.id === messageId ? { ...m, status: "send_failed" } : m) };
       });
       throw e;
     }
@@ -587,8 +765,10 @@ export default function App() {
     const updated = await invoke<BackendContact>("messaging_migrate_contact_with_code", { contactId, code });
     const next = contactFromBackend(updated);
     setContacts(prev => prev.map(c => c.id === contactId ? next : c));
-    invoke("messaging_connect_all").catch(() => {});
-    await loadMessaging().catch(() => {});
+    // Migrating points this contact at a new relay/route, so connect once (with
+    // the banner) — not via loadMessaging, which would connect a second time.
+    await refreshSnapshot().catch(() => {});
+    await connectAll(true);
   };
 
   const selectContact = async (id: string) => {
@@ -658,8 +838,8 @@ export default function App() {
               strokeLinecap="round"
               style={{ transform: "rotate(-90deg)", transformOrigin: "22px 22px", transition: "stroke-dashoffset 0.3s ease" }} />
           </svg>
-          <p className="shutdown-title">Randomising connection closes…</p>
-          <p className="shutdown-subtitle">Staggering relay disconnects to make your mailboxes harder to correlate.</p>
+          <p className="shutdown-title">Closing connections…</p>
+          <p className="shutdown-subtitle">Disconnecting each conversation on a random delay so they're harder to correlate.</p>
           <div className="shutdown-bar"><div className="shutdown-bar-fill" style={{ width: `${pct}%` }} /></div>
           {total > 0 && <p className="shutdown-count">{closed} / {total}</p>}
         </div>
@@ -691,7 +871,7 @@ export default function App() {
   return (
     <div className="app-root">
       <UpdatePrompt enabled={settings.autoUpdateCheck} updateOverTor={settings.updateOverTor} />
-      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
+      <Sidebar contacts={contacts} allMessages={messages} activeContactId={activeContactIdForUi} onSelectContact={selectContact} onDeleteContact={deleteContact} onBlockContact={deleteAndBlockContact} onOpenAddContact={() => setShowAddContact(true)} onOpenSettings={() => setShowSettings(true)} onLock={() => { void lockApp(); }} myInitials={computeInitials(displayName)} myDisplayName={displayName || "Me"} torStatus={torStatus} syncing={syncing} connectCountdown={connectCountdown} />
 
       {active ? (
         <ChatView contact={active} messages={messages[active.id] || []} fileProgress={fileProgress} onOpenChatSettings={() => setShowChatSettings(true)} onOpenVerify={() => setShowVerify(true)} onSendMessage={(text) => sendMessage(active.id, text)} onSendFile={() => sendFile(active.id)} onDownloadFile={downloadFile} onOpenLink={(url) => { setLinkCopied(false); setLinkPrompt(url); }} sendOnEnter={settings.sendOnEnter} messageTextSize={settings.messageTextSize} />

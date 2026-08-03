@@ -5,6 +5,8 @@ import {
 } from "../icons";
 import "./Onboarding.css";
 import { invoke } from "@tauri-apps/api/core";
+import PasswordStrengthMeter from "../PasswordStrengthMeter/PasswordStrengthMeter";
+import { evaluatePassword, checkPasswordAcceptable, PasswordStrength } from "../../passwordStrength";
 
 interface Props {
   onComplete: (displayName: string) => void;
@@ -26,6 +28,19 @@ export default function Onboarding({ onComplete }: Props) {
   const [passwordError, setPasswordError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [displayName, setDisplayName] = useState("");
+  // Strength + length are derived from the password ref on each keystroke and
+  // held here so the meter can render; the raw passphrase is never put in state.
+  const [strength, setStrength] = useState<PasswordStrength | null>(null);
+  const [passwordLength, setPasswordLength] = useState(0);
+
+  const refreshStrength = () => {
+    const pw = passwordRef.current?.value ?? "";
+    const confirm = confirmPasswordRef.current?.value ?? "";
+    setPasswordLength(pw.length);
+    setStrength(pw ? evaluatePassword(pw, [displayName]) : null);
+    setPasswordReady(pw.length > 0 && confirm.length > 0);
+    setPasswordError("");
+  };
 
   const startNewIdentity = () => {
     setStep("set-profile");
@@ -34,8 +49,9 @@ export default function Onboarding({ onComplete }: Props) {
   const submitPassword = async () => {
     const password = passwordRef.current?.value ?? "";
     const confirmPassword = confirmPasswordRef.current?.value ?? "";
-    if (password.length < 12) {
-      setPasswordError("Password must be at least 12 characters. A 4-5 word passphrase is better.");
+    const acceptable = checkPasswordAcceptable(password, [displayName]);
+    if (!acceptable.ok) {
+      setPasswordError(acceptable.reason);
       return;
     }
     if (password !== confirmPassword) {
@@ -55,11 +71,15 @@ export default function Onboarding({ onComplete }: Props) {
       if (passwordRef.current) passwordRef.current.value = "";
       if (confirmPasswordRef.current) confirmPasswordRef.current.value = "";
       setPasswordReady(false);
+      setStrength(null);
+      setPasswordLength(0);
       setStep("done");
     } catch (err) {
       if (passwordRef.current) passwordRef.current.value = "";
       if (confirmPasswordRef.current) confirmPasswordRef.current.value = "";
       setPasswordReady(false);
+      setStrength(null);
+      setPasswordLength(0);
       console.error("Failed to generate identity:", err);
       setPasswordError(
         typeof err === "string" ? err : "Encryption failed. Please try a different password."
@@ -167,7 +187,7 @@ export default function Onboarding({ onComplete }: Props) {
                 className="onboarding-key-input"
                 placeholder="Password"
                 ref={passwordRef}
-                onChange={e => { setPasswordReady(e.currentTarget.value.length > 0 && (confirmPasswordRef.current?.value.length ?? 0) > 0); setPasswordError(""); }}
+                onChange={refreshStrength}
                 autoFocus
               />
               <button type="button" className="onboarding-eye-btn" onClick={() => setShowPassword(!showPassword)}>
@@ -175,13 +195,25 @@ export default function Onboarding({ onComplete }: Props) {
               </button>
             </div>
 
+            <PasswordStrengthMeter strength={strength} length={passwordLength} />
+
             <input
               type={showPassword ? "text" : "password"}
               className="onboarding-key-input"
               placeholder="Confirm password"
               ref={confirmPasswordRef}
-              onChange={e => { setPasswordReady(e.currentTarget.value.length > 0 && (passwordRef.current?.value.length ?? 0) > 0); setPasswordError(""); }}
+              onChange={refreshStrength}
             />
+
+            <div className="onboarding-recovery-warning">
+              <IconLock />
+              <span>
+                There is no password reset and no recovery. If you forget this password,
+                your identity and your entire message history are lost permanently — no
+                one, including us, can restore them. Consider a 4–5 word passphrase and
+                store it in a password manager.
+              </span>
+            </div>
 
             {passwordError && <div className="onboarding-error">{passwordError}</div>}
 

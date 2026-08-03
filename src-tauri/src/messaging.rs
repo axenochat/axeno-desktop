@@ -64,6 +64,12 @@ pub struct MessagingRuntimeState {
     /// which the UI triggers on every incoming message — from racing and
     /// flipping a still-in-flight send to "failed".
     startup_recovery_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Message ids the resend sweeper is currently re-transmitting. Prevents two
+    /// overlapping sweeps (it is triggered from several reconnect moments) from
+    /// transmitting the same message concurrently. The recipient dedups by inner
+    /// message_id, so a redundant resend is harmless regardless — this just avoids
+    /// wasted work and needless ratchet churn.
+    resending: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,14 +189,21 @@ pub struct FileAttachment {
 const FILE_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
 /// AEAD tag length added to every encrypted chunk (ChaCha20-Poly1305).
 const FILE_CHUNK_TAG_BYTES: u64 = 16;
-/// Absolute ceiling on an incoming file's declared plaintext size, independent of
-/// any relay's per-file cap. A file lives on the *sender's* relay, which a
-/// malicious contact may control, so we cannot rely on that relay to bound the
-/// size. This is the recipient-side safety net that keeps a download from filling
-/// the disk; combined with `file_pointer_is_sane` (declared chunk count must match
-/// size) and the running `written > size` guard in `download_file`, the bytes a
-/// download can ever write are bounded by the declared, sanity-checked `size`.
-const MAX_INCOMING_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Validate a peer-supplied file pointer's self-declared shape: non-empty, with a
+/// sane chunk size and a chunk count that exactly matches `ceil(size / chunk_size)`.
+///
+/// We deliberately do NOT impose a client-side maximum size. The blob lives on the
+/// *sender's* relay, whose operator sets the size cap (and enforces it at upload),
+/// so an arbitrary number baked into the client would only block transfers that the
+/// relay operators actually allow. The recipient sees the declared size in the UI
+/// and chooses whether to download. What this guards against is malformed/abusive
+/// metadata: a chunk count that disagrees with the size (which could otherwise spin
+/// the download loop or let a sender misrepresent the transfer).
+fn file_pointer_shape_ok(size: u64, chunk_size: u32, total_chunks: u32) -> bool {
+    if size == 0 || chunk_size == 0 || total_chunks == 0 { return false; }
+    size.div_ceil(chunk_size as u64) == total_chunks as u64
+}
 
 /// The wire pointer for a "file" payload: everything the recipient needs to
 /// fetch and decrypt the blob, carried inside the E2E-encrypted Signal body.
@@ -642,7 +655,7 @@ fn decode_signal_plaintext(raw: Vec<u8>) -> Result<DecryptedSignalText, String> 
             message_id: payload.message_id,
             sent_at_ms: payload.sent_at_ms,
             body: payload.body,
-            sender_display_name: payload.sender_display_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            sender_display_name: payload.sender_display_name.map(|s| clamp_display_name(&s)).filter(|s| !s.is_empty()),
             sender_mailbox_id: payload.sender_mailbox_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             sender_delivery_token: payload.sender_delivery_token.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             sender_delivery_token_epoch: payload.sender_delivery_token_epoch.filter(|epoch| *epoch > 0),
@@ -1082,6 +1095,64 @@ pub fn promote_rekey_sidecar(app: &AppHandle, new_root_key: &[u8; 32]) -> Result
 }
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
+
+/// Rank of an outgoing message's delivery status along the monotonic ladder
+/// `send_failed` → `relay_pending` → `relay_queued` → `relay_received`. A status
+/// that is not on this ladder (a peer-side status) returns `None` and is treated
+/// as off-ladder: the monotonic setter leaves it untouched.
+///
+/// `send_failed` sits at the BOTTOM (rank 0), not off-ladder, on purpose: a
+/// failure signal and a delivery confirmation race back to the sender over
+/// independent Tor circuits, and the warm-connection writer can report a write
+/// failure for a frame that a fallback circuit (or an earlier attempt) already
+/// delivered. Ranking `send_failed` below the confirmed states lets a real
+/// relay ack or peer `delivery_ack` lift a wrongly-failed message back onto the
+/// ladder, instead of leaving a delivered message stuck displaying "failed".
+fn mine_status_rank(status: &str) -> Option<u8> {
+    match status {
+        "send_failed" => Some(0),
+        "relay_pending" => Some(1),
+        "relay_queued" => Some(2),
+        "relay_received" => Some(3),
+        _ => None,
+    }
+}
+
+/// Advance an outgoing message's status forward along the delivery ladder, never
+/// backward. The relay's `SendOk{queued}` and the peer's `delivery_ack` travel
+/// back to the sender over independent Tor circuits, so they routinely arrive
+/// out of order. Without a monotonic guard a late `SendOk{queued:true}` could
+/// downgrade a message the peer has already confirmed receiving (`relay_received`)
+/// back to `relay_queued`, leaving it stuck on "queued" forever even though it was
+/// delivered. Only a strictly higher-ranked status is applied. Because
+/// `send_failed` ranks below the confirmed states, a confirmed ack here also
+/// clears a transient/false failure (see `mine_status_rank`).
+fn advance_mine_status(msg: &mut StoredMessage, candidate: &str) {
+    if let (Some(cur), Some(new)) = (mine_status_rank(&msg.status), mine_status_rank(candidate)) {
+        if new > cur {
+            msg.status = candidate.to_string();
+        }
+    }
+}
+
+/// Mark an outgoing message `send_failed`, but ONLY while it is still unconfirmed
+/// by the relay (currently `relay_pending`, or already `send_failed`). A failure
+/// event can arrive late — after the message actually landed via the one-shot
+/// fallback circuit or a resend, or after the peer's `delivery_ack` already
+/// advanced it — so it must never clobber a message the relay/peer has confirmed
+/// (`relay_queued`/`relay_received`). Returns true if the status changed.
+fn mark_send_failed_monotonic(msg: &mut StoredMessage) -> bool {
+    match mine_status_rank(&msg.status) {
+        // send_failed (0) is a no-op; relay_pending (1) downgrades to failed.
+        Some(rank) if rank <= 1 => {
+            let changed = msg.status != "send_failed";
+            msg.status = "send_failed".to_string();
+            changed
+        }
+        // relay_queued / relay_received / off-ladder: keep the confirmed status.
+        _ => false,
+    }
+}
 fn fill_random(buf: &mut [u8]) -> Result<(), String> { getrandom::getrandom(buf).map_err(|e| format!("OS randomness unavailable: {e}")) }
 
 /// Upper bound on the random per-route startup delay used to stagger connection
@@ -1758,6 +1829,15 @@ fn clean_relay_display_name(input: Option<String>) -> Option<String> {
     Some(name.chars().take(80).collect())
 }
 
+/// Upper bound (in characters) on a peer-supplied display name. A connection code
+/// or message can carry an arbitrary name; without a cap a malicious peer/relay
+/// could bloat the encrypted store and the UI with a multi-KB string. Trim, then
+/// clamp by character count (not bytes, so multibyte names aren't split).
+const MAX_DISPLAY_NAME_CHARS: usize = 80;
+fn clamp_display_name(name: &str) -> String {
+    name.trim().chars().take(MAX_DISPLAY_NAME_CHARS).collect()
+}
+
 fn connection_code_response(store: &MessagingStore, pending: &PendingInvite) -> ConnectionCodeResponse {
     let current_name = relay_display_name_for_url(store, &pending.server_url);
     let server_name = if current_name == "Unknown relay" {
@@ -1833,7 +1913,7 @@ fn contact_from_payload(payload: InvitePayload, local_identity_public: &[u8]) ->
     }
     Ok(StoredContact {
         id: payload.mailbox_id.clone(),
-        display_name: Some(payload.display_name.clone()).filter(|s| !s.trim().is_empty()),
+        display_name: Some(clamp_display_name(&payload.display_name)).filter(|s| !s.is_empty()),
         recipient_id: payload.mailbox_id.clone(),
         server_url: server_url.clone(),
         server_id: server_id_for_url(&server_url),
@@ -2521,7 +2601,14 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
     //
     // Pre-compute all delays so we can return the actual max to the frontend for
     // an accurate countdown (rather than always showing the theoretical max).
-    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() {
+    //
+    // Staggering only buys unlinkability when there are at least two mailboxes to
+    // spread apart: the whole point is to stop a logging relay grouping several
+    // mailboxes that appear together at unlock. With a single route (e.g. just one
+    // contact) there is nothing to decorrelate it against, so jitter would only
+    // delay the lone connection for no privacy gain — connect it immediately, the
+    // same as when the user has turned the obfuscation off.
+    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() && routes.len() >= 2 {
         routes.iter().map(|_| jittered_connect_delay()).collect()
     } else {
         routes.iter().map(|_| std::time::Duration::ZERO).collect()
@@ -2611,6 +2698,35 @@ async fn send_signal_payload_internal(
         (contact, sender_route)
     };
 
+    // Mint the id/timestamp up front (a file send forces its id from the UI). For
+    // a visible text, persist the row as relay_pending NOW — before the sender
+    // certificate and Tor send, which can take tens of seconds on a cold circuit.
+    // Persisting late was why a send could "vanish": during that window a snapshot
+    // refresh (triggered by any inbound event) replaced the UI with a store that
+    // did not yet contain the message, wiping the optimistic bubble, and the row
+    // only materialized — stuck at relay_pending — in time for the restart sweep to
+    // flip it to failed. A durable row from t0 means the UI can always recover it
+    // and the resend sweeper (retry_pending_sends) can finish the job.
+    let message_id = forced_message_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let sent_at = now_ms();
+    if visible && payload_kind == "text" {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        if !store.messages.iter().any(|m| m.id == message_id && m.mine) {
+            store.messages.push(StoredMessage {
+                id: message_id.clone(),
+                contact_id: contact_id.clone(),
+                mine: true,
+                text: trimmed.clone(),
+                timestamp: sent_at,
+                received_at_ms: None,
+                status: "relay_pending".to_string(),
+                attachment: None,
+            });
+            save_store_with_key(&app, &store, &store_key)?;
+        }
+    }
+
     let connection_id_for_cert = route_connection_id(&sender_route_for_cert);
     let cert = match transport::request_sender_certificate(
         transport_state,
@@ -2658,11 +2774,6 @@ async fn send_signal_payload_internal(
             cert
         }
     };
-
-    // A file send pre-generates its id in the UI so the optimistic bubble and the
-    // upload-progress events share one id; everything else mints a fresh id here.
-    let message_id = forced_message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let sent_at = now_ms();
 
     // For a file send, upload the encrypted blob now — to the sender's own relay
     // (`sender_route_for_cert`, the warm connection that just issued the cert) —
@@ -2742,20 +2853,34 @@ async fn send_signal_payload_internal(
         let padded = pad_ciphertext(&encrypted.sealed_sender)?;
         let wire = SealedSignalWireMessage { v: 1, sealed_sender_b64: STANDARD_NO_PAD.encode(padded) };
         let maybe_msg = if visible {
-            let msg = StoredMessage {
-                id: message_id.clone(),
-                contact_id: contact.id.clone(),
-                mine: true,
-                // A file bubble renders from its attachment, not body text (which
-                // is the opaque pointer JSON), so keep the visible text empty.
-                text: if payload_kind == "file" { String::new() } else { trimmed.clone() },
-                timestamp: sent_at,
-                received_at_ms: None,
-                status: "relay_pending".to_string(),
-                attachment: file_attachment.clone(),
-            };
-            store.messages.push(msg.clone());
-            Some(msg)
+            // Upsert by id: a text send already persisted this row up front (and a
+            // resend reuses the same id), so update in place rather than pushing a
+            // duplicate. Only a fresh file send actually inserts here.
+            let text_for_store = if payload_kind == "file" { String::new() } else { trimmed.clone() };
+            if let Some(existing) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
+                existing.text = text_for_store;
+                existing.timestamp = sent_at;
+                existing.attachment = file_attachment.clone();
+                // Keep status monotonic: an in-flight ack may already have advanced
+                // it; never knock it back to relay_pending on a re-entry/resend.
+                advance_mine_status(existing, "relay_pending");
+                Some(existing.clone())
+            } else {
+                let msg = StoredMessage {
+                    id: message_id.clone(),
+                    contact_id: contact.id.clone(),
+                    mine: true,
+                    // A file bubble renders from its attachment, not body text (which
+                    // is the opaque pointer JSON), so keep the visible text empty.
+                    text: text_for_store,
+                    timestamp: sent_at,
+                    received_at_ms: None,
+                    status: "relay_pending".to_string(),
+                    attachment: file_attachment.clone(),
+                };
+                store.messages.push(msg.clone());
+                Some(msg)
+            }
         } else {
             None
         };
@@ -2807,14 +2932,14 @@ async fn send_signal_payload_internal(
     match send_result {
         Ok(ack) => {
             if visible {
-                let next_status = if ack.queued { "relay_queued" } else { "relay_received" }.to_string();
-                if let Some(ref mut msg) = maybe_msg {
-                    msg.status = next_status.clone();
-                }
+                // Advance the stored status monotonically: a peer `delivery_ack`
+                // (relay_received) can land before this `SendOk{queued:true}` over
+                // a faster circuit, and must not be downgraded back to queued.
+                let candidate = if ack.queued { "relay_queued" } else { "relay_received" };
                 let _store_guard = session.messaging_store_lock.lock().await;
                 if let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) {
                     if let Some(stored) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
-                        stored.status = next_status;
+                        advance_mine_status(stored, candidate);
                         if let Some(ref mut msg) = maybe_msg {
                             *msg = stored.clone();
                         }
@@ -2830,14 +2955,18 @@ async fn send_signal_payload_internal(
             }
         }
         Err(err_msg) => {
-            if let Some(ref mut msg) = maybe_msg {
-                msg.status = "send_failed".to_string();
-            }
+            // Persist failure monotonically: a resend of a message the peer already
+            // received (its `delivery_ack` advanced it to `relay_received`) can fail
+            // on this attempt, and must not be knocked back to `send_failed`. The
+            // store is authoritative; mirror its post-guard status into `maybe_msg`.
             let _store_guard = session.messaging_store_lock.lock().await;
             if let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) {
-                if let Some(stored) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
-                    stored.status = "send_failed".to_string();
-                    let _ = save_store_with_key(&app, &store, &store_key);
+                let updated = store.messages.iter_mut()
+                    .find(|m| m.id == message_id && m.mine)
+                    .map(|stored| (mark_send_failed_monotonic(stored), stored.clone()));
+                if let Some((changed, snapshot)) = updated {
+                    if changed { let _ = save_store_with_key(&app, &store, &store_key); }
+                    if let Some(ref mut msg) = maybe_msg { *msg = snapshot; }
                 }
             }
             let _ = app.emit("axeno-send-failed", transport::SendFailure {
@@ -2874,6 +3003,7 @@ pub async fn send_text_message(
     tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
     contact_id: String,
     text: String,
+    forced_message_id: Option<String>,
 ) -> Result<SendMessageResponse, String> {
     let message = send_signal_payload_internal(
         app,
@@ -2886,10 +3016,116 @@ pub async fn send_text_message(
         true,
         false,
         None,
-        None,
+        forced_message_id,
     ).await?
     .ok_or_else(|| "message send did not produce a local message".to_string())?;
     Ok(SendMessageResponse { message })
+}
+
+/// Minimum age before a still-`relay_pending` send is treated as stalled and
+/// eligible for resend. Generous so it never races a legitimately in-flight send
+/// (a cold-circuit certificate + send can take a while); the recipient's
+/// message_id dedup makes an over-eager resend harmless anyway.
+const RESEND_PENDING_MIN_AGE_MS: u64 = 60 * 1000;
+/// Cap how many stalled sends a single sweep drains, so a large backlog can't
+/// fan out into a burst of concurrent Tor sends. The next sweep takes the rest.
+const RESEND_MAX_PER_SWEEP: usize = 16;
+
+/// Re-transmit outgoing TEXT messages that never reached the relay: status
+/// `send_failed`, or `relay_pending` for longer than [`RESEND_PENDING_MIN_AGE_MS`]
+/// (the original attempt died with the process, or stalled on a cold circuit).
+///
+/// This is the durability backstop that turns "best-effort send" into "send that
+/// eventually lands". It is safe to call repeatedly and concurrently: the
+/// recipient dedups by inner message_id (see `handle_incoming_envelope`), so a
+/// resend can never double-deliver — the worst case is one extra Signal ratchet
+/// message the peer discards — and the in-memory `resending` guard stops two
+/// sweeps from re-sending the same id at once. File sends are deliberately not
+/// retried here (resending would require re-uploading the blob); those are left
+/// as `send_failed` for the user to resend manually.
+pub async fn retry_pending_sends(
+    app: AppHandle,
+    session: &AppSessionState,
+    runtime: &MessagingRuntimeState,
+    transport_state: &transport::TransportState,
+    tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
+) -> Result<(), String> {
+    // Wait for the one-time startup recovery sweep to reclassify a prior process's
+    // orphaned relay_pending rows to send_failed first, so we act on a settled set
+    // rather than racing it.
+    if !runtime.startup_recovery_done.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    let (store_key, legacy_store_key) = store_keys(session).await?;
+    let candidates: Vec<(String, String, String)> = {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        let now = now_ms();
+        store
+            .messages
+            .iter()
+            .filter(|m| m.mine && m.attachment.is_none() && !m.text.trim().is_empty())
+            .filter(|m| {
+                m.status == "send_failed"
+                    || (m.status == "relay_pending"
+                        && now.saturating_sub(m.timestamp) >= RESEND_PENDING_MIN_AGE_MS)
+            })
+            .map(|m| (m.id.clone(), m.contact_id.clone(), m.text.clone()))
+            .collect()
+    };
+
+    let mut resent = 0usize;
+    for (message_id, contact_id, text) in candidates {
+        if resent >= RESEND_MAX_PER_SWEEP {
+            break;
+        }
+        // Claim this id; skip if another sweep already owns it.
+        if !runtime.resending.lock().await.insert(message_id.clone()) {
+            continue;
+        }
+        // Reflect the in-flight retry in the UI (and clear a prior send_failed).
+        reset_send_status_to_pending(&app, session, &store_key, &legacy_store_key, &message_id).await;
+        let result = send_signal_payload_internal(
+            app.clone(),
+            session,
+            transport_state,
+            tor_client.clone(),
+            contact_id,
+            "text",
+            text,
+            true,
+            false,
+            None,
+            Some(message_id.clone()),
+        )
+        .await;
+        runtime.resending.lock().await.remove(&message_id);
+        if result.is_ok() {
+            resent += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Reset a stalled/failed outgoing message back to `relay_pending` so the UI shows
+/// it as sending again while a resend is attempted. Emits an `axeno-send-receipt`
+/// so the open UI updates without waiting for the next snapshot.
+async fn reset_send_status_to_pending(
+    app: &AppHandle,
+    session: &AppSessionState,
+    store_key: &[u8; 32],
+    legacy_store_key: &[u8; 32],
+    message_id: &str,
+) {
+    let _store_guard = session.messaging_store_lock.lock().await;
+    if let Ok(mut store) = load_store_with_keys(app, store_key, legacy_store_key) {
+        if let Some(m) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) {
+            if m.status == "send_failed" {
+                m.status = "relay_pending".to_string();
+                let _ = save_store_with_key(app, &store, store_key);
+            }
+        }
+    }
 }
 
 /// Progress for an in-flight file transfer, emitted as `axeno-file-progress`.
@@ -2925,24 +3161,6 @@ fn file_cipher(key_b64: &str) -> Result<ChaCha20Poly1305, String> {
     let key = STANDARD_NO_PAD.decode(key_b64.as_bytes()).map_err(|_| "bad file key encoding".to_string())?;
     if key.len() != 32 { return Err("file key must be 32 bytes".into()); }
     Ok(ChaCha20Poly1305::new(Key::from_slice(&key)))
-}
-
-/// Validate a peer-supplied file pointer's declared shape before we trust it
-/// enough to download. The `size`, `chunk_size`, and `total_chunks` are all
-/// author-controlled and the blob sits on the sender's (possibly hostile) relay,
-/// so without this a small `size` could smuggle a huge `total_chunks` and stream
-/// far more bytes to disk than declared. Requiring the chunk count to be exactly
-/// what `size`/`chunk_size` imply — plus a bounded chunk size and an absolute size
-/// ceiling — closes that amplification. `download_file` additionally aborts the
-/// moment the bytes written exceed `size`, so a lying relay cannot overrun either.
-fn file_pointer_is_sane(p: &FilePointer) -> bool {
-    let chunk_size = p.chunk_size as u64;
-    p.size > 0
-        && p.size <= MAX_INCOMING_FILE_BYTES
-        && chunk_size > 0
-        && chunk_size <= FILE_CHUNK_PLAINTEXT_BYTES as u64
-        && p.total_chunks > 0
-        && (p.total_chunks as u64) == p.size.div_ceil(chunk_size)
 }
 
 /// Deterministic 96-bit nonce for chunk `index`. The file key is random and used
@@ -3129,6 +3347,13 @@ pub async fn download_file(
         (att, msg.contact_id.clone())
     };
 
+    // Re-validate the stored pointer before writing anything: an attachment
+    // persisted by an older build (or a tampered store) with inconsistent
+    // chunk/size metadata must not be able to drive a malformed download.
+    if !file_pointer_shape_ok(attachment.size, attachment.chunk_size, attachment.total_chunks) {
+        return Err("this file's metadata is invalid".into());
+    }
+
     let cipher = file_cipher(&attachment.key_b64)?;
     let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "downloading", None).await?;
 
@@ -3188,15 +3413,14 @@ pub async fn download_file(
                 return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file chunk failed to decrypt (wrong key or corrupted)".to_string()));
             }
         };
-        // The blob sits on the sender's relay, which a hostile contact may control,
-        // so a chunk can decrypt fine yet carry more bytes than declared. Bound the
-        // write to the sanity-checked declared size (and per-chunk cap) so a lying
-        // relay can never overrun the disk beyond `attachment.size`.
-        if plain.len() as u64 > attachment.chunk_size as u64
-            || written.saturating_add(plain.len() as u64) > attachment.size
-        {
+        // Enforce the declared size as we go, not only at the end: a malicious
+        // sender holds the file key and can encrypt oversized chunks, so without a
+        // running cap they could stream far more than the size the user agreed to
+        // download before the final mismatch check deletes the partial. Abort the
+        // moment the cumulative plaintext would exceed the declared total.
+        if written.saturating_add(plain.len() as u64) > attachment.size {
             let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
-            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file transfer sent more data than it declared".to_string()));
+            return Err(fail(&app, &message_id, &contact_id, attachment.size, &part_path, "file is larger than its declared size".to_string()));
         }
         if let Err(e) = file.write_all(&plain) {
             let _ = update_attachment_state(&app, session, &store_key, &legacy_store_key, &message_id, "failed", None).await;
@@ -3420,7 +3644,7 @@ pub async fn handle_incoming_envelope(
         // (we deliberately do not auto-fetch the blob — the recipient decides when
         // to spend the bandwidth). The bubble renders from the attachment.
         match serde_json::from_str::<FilePointer>(&decrypted.message.body) {
-            Ok(p) if p.v == 1 && file_pointer_is_sane(&p) => {
+            Ok(p) if p.v == 1 && file_pointer_shape_ok(p.size, p.chunk_size, p.total_chunks) => {
                 let attachment = FileAttachment {
                     transfer_id: p.transfer_id,
                     key_b64: p.key_b64,
@@ -3457,11 +3681,21 @@ pub async fn handle_incoming_envelope(
         // relay_queued → relay_received to show the peer actually got it.
         let acked_id = decrypted.message.body.trim().to_string();
         if !acked_id.is_empty() {
+            // The ack is the peer's proof of receipt — the strongest delivery
+            // signal there is — so advance the message to relay_received from
+            // anywhere below it on the ladder. Crucially this includes a message
+            // wrongly left at `send_failed` by a racing/stale write error: a real
+            // ack means it WAS delivered, so it must recover rather than stay
+            // "failed". `advance_mine_status` never downgrades an already-received
+            // one, and is a no-op for an off-ladder status.
             if let Some(stored) = store.messages.iter_mut().find(|m| {
-                m.id == acked_id && m.mine && m.contact_id == contact_id && m.status == "relay_queued"
+                m.id == acked_id && m.mine && m.contact_id == contact_id
             }) {
-                stored.status = "relay_received".to_string();
-                delivery_ack_upgraded_msg_id = Some(acked_id);
+                let before = stored.status.clone();
+                advance_mine_status(stored, "relay_received");
+                if stored.status != before {
+                    delivery_ack_upgraded_msg_id = Some(acked_id);
+                }
             }
         }
         None
@@ -3607,7 +3841,11 @@ pub async fn mark_message_relay_received(app: AppHandle, session: &AppSessionSta
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     let Some(msg) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) else { return Ok(None); };
-    msg.status = if queued { "relay_queued".to_string() } else { "relay_received".to_string() };
+    // Monotonic: this is driven by the `axeno-send-receipt` event, which fires for
+    // both the relay's SendOk and the peer's delivery_ack. They race over separate
+    // circuits, so apply the candidate only if it moves the status forward — never
+    // downgrade a delivered (relay_received) message back to relay_queued.
+    advance_mine_status(msg, if queued { "relay_queued" } else { "relay_received" });
     let out = msg.clone();
     save_store_with_key(&app, &store, &store_key)?;
     Ok(Some(out))
@@ -3618,9 +3856,13 @@ pub async fn mark_message_send_failed(app: AppHandle, session: &AppSessionState,
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     let Some(msg) = store.messages.iter_mut().find(|m| m.id == message_id && m.mine) else { return Ok(None); };
-    msg.status = "send_failed".to_string();
+    // Only fail an unconfirmed send. A `send_failed` event routinely arrives late
+    // — the warm-connection writer reports a stale frame's write failure after a
+    // fallback circuit already delivered the message — and must not clobber a
+    // message the relay/peer has already confirmed.
+    let changed = mark_send_failed_monotonic(msg);
     let out = msg.clone();
-    save_store_with_key(&app, &store, &store_key)?;
+    if changed { save_store_with_key(&app, &store, &store_key)?; }
     Ok(Some(out))
 }
 
@@ -4528,6 +4770,42 @@ mod signal_protocol_engine {
 }
 
 #[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_is_trimmed_and_capped() {
+        assert_eq!(clamp_display_name("  Alice  "), "Alice");
+        let long = "x".repeat(500);
+        assert_eq!(clamp_display_name(&long).chars().count(), MAX_DISPLAY_NAME_CHARS);
+        // Multibyte names are clamped by character, never split mid-codepoint.
+        let emoji = "🙂".repeat(200);
+        assert_eq!(clamp_display_name(&emoji).chars().count(), MAX_DISPLAY_NAME_CHARS);
+    }
+
+    #[test]
+    fn file_pointer_shape_validation() {
+        let chunk = FILE_CHUNK_PLAINTEXT_BYTES as u32;
+        // A well-formed pointer: chunk count matches ceil(size / chunk_size).
+        assert!(file_pointer_shape_ok(chunk as u64 + 1, chunk, 2));
+        assert!(file_pointer_shape_ok(1, chunk, 1));
+        // Zero / empty is rejected.
+        assert!(!file_pointer_shape_ok(0, chunk, 0));
+        assert!(!file_pointer_shape_ok(100, 0, 1));
+        assert!(!file_pointer_shape_ok(100, chunk, 0));
+        // Chunk count inconsistent with the declared size is rejected (a malicious
+        // sender can't understate or overstate the chunk count to misrepresent the
+        // transfer or spin the download loop).
+        assert!(!file_pointer_shape_ok(chunk as u64 + 1, chunk, 1));
+        assert!(!file_pointer_shape_ok(100, chunk, 5));
+        // A large size is fine as long as it is internally consistent: the relay
+        // operator, not the client, decides the maximum file size.
+        let big = 10 * 1024 * 1024 * 1024u64; // 10 GiB
+        assert!(file_pointer_shape_ok(big, chunk, big.div_ceil(chunk as u64) as u32));
+    }
+}
+
+#[cfg(test)]
 mod route_tests {
     use super::*;
 
@@ -4689,5 +4967,259 @@ mod route_tests {
         let old_route = store.local_routes.iter().find(|r| r.id == retiring_id).unwrap();
         assert!(old_route.active);
         assert_eq!(old_route.replacement_route_id.as_deref(), Some(outcome.route.id.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod status_ladder_tests {
+    use super::*;
+
+    fn mine(status: &str) -> StoredMessage {
+        StoredMessage {
+            id: "m".to_string(),
+            contact_id: "c".to_string(),
+            mine: true,
+            text: "hi".to_string(),
+            timestamp: 0,
+            received_at_ms: None,
+            status: status.to_string(),
+            attachment: None,
+        }
+    }
+
+    #[test]
+    fn late_failure_does_not_clobber_a_confirmed_send() {
+        // The peer already confirmed receipt; a stale write-failure event then
+        // arrives. The message must stay delivered, not flip back to failed.
+        for confirmed in ["relay_queued", "relay_received"] {
+            let mut m = mine(confirmed);
+            let changed = mark_send_failed_monotonic(&mut m);
+            assert!(!changed, "{confirmed} must not change");
+            assert_eq!(m.status, confirmed);
+        }
+    }
+
+    #[test]
+    fn failure_applies_while_still_pending() {
+        let mut m = mine("relay_pending");
+        assert!(mark_send_failed_monotonic(&mut m));
+        assert_eq!(m.status, "send_failed");
+        // Idempotent: failing an already-failed message reports no change.
+        assert!(!mark_send_failed_monotonic(&mut m));
+    }
+
+    #[test]
+    fn confirmed_ack_lifts_a_wrongly_failed_message() {
+        // A message marked failed by a racing write error, then the real relay ack
+        // (or peer delivery_ack) lands: it must recover onto the delivery ladder.
+        let mut m = mine("send_failed");
+        advance_mine_status(&mut m, "relay_queued");
+        assert_eq!(m.status, "relay_queued");
+        advance_mine_status(&mut m, "relay_received");
+        assert_eq!(m.status, "relay_received");
+    }
+
+    #[test]
+    fn confirmed_status_is_never_downgraded() {
+        let mut m = mine("relay_received");
+        advance_mine_status(&mut m, "relay_queued");
+        assert_eq!(m.status, "relay_received");
+    }
+}
+
+#[cfg(test)]
+mod messaging_roundtrip_tests {
+    //! Full two-party messaging round-trip with REAL libsignal crypto: a fresh
+    //! identity (Alice) builds a Signal session to another (Bob) from Bob's
+    //! connection-code prekey bundle, encrypts a sealed-sender message under a
+    //! relay-style sender certificate, and Bob decrypts it — recovering the
+    //! plaintext, Bob's consumed one-time prekey, and Alice's stable identity.
+    //! This exercises X3DH/PQXDH, the double-ratchet init, libsignal sealed
+    //! sender, the certificate trust-root validation, and the Axeno plaintext
+    //! envelope encode/decode end to end (no relay process needed: the engine
+    //! functions operate on plain structs).
+
+    use super::*;
+    use crate::identity::create_identity;
+    use libsignal_protocol::{
+        DeviceId, KeyPair, PublicKey, SenderCertificate, ServerCertificate, Timestamp,
+    };
+
+    fn material_from(secrets: &crate::identity::VaultSecrets) -> PrivateSignalMaterial {
+        PrivateSignalMaterial {
+            identity_priv: secrets.identity_priv.clone(),
+            spk_priv: secrets.spk_priv.clone(),
+            previous_spks_secret: secrets.previous_spks_secret.clone(),
+            opks_secret: secrets.opks_secret.clone(),
+            display_name: secrets.display_name.clone(),
+        }
+    }
+
+    /// Mint a sender certificate exactly the way the relay does (fresh trust root
+    /// + server signing key, a ServerCertificate, then a SenderCertificate over the
+    /// sender's route certificate key), returning the cert response and the
+    /// matching trust-root the recipient validates against.
+    fn mint_cert(route_cert_pub_b64: &str, sender_uuid: &str) -> (transport::SenderCertificateResponse, String) {
+        let mut rng = fresh_signal_rng().unwrap();
+        let trust_root = KeyPair::generate(&mut rng);
+        let server_signing = KeyPair::generate(&mut rng);
+        let server_cert = ServerCertificate::new(1, server_signing.public_key, &trust_root.private_key, &mut rng).unwrap();
+        let sender_public = PublicKey::deserialize(&STANDARD_NO_PAD.decode(route_cert_pub_b64).unwrap()).unwrap();
+        let device: DeviceId = 1u32.try_into().unwrap();
+        let expires = now_ms() + 24 * 60 * 60 * 1000;
+        let cert = SenderCertificate::new(
+            sender_uuid.to_string(),
+            None,
+            sender_public,
+            device,
+            Timestamp::from_epoch_millis(expires),
+            server_cert,
+            &server_signing.private_key,
+            &mut rng,
+        ).unwrap();
+        let cert_b64 = STANDARD_NO_PAD.encode(cert.serialized().unwrap());
+        let trust_root_b64 = STANDARD_NO_PAD.encode(trust_root.public_key.serialize());
+        (
+            transport::SenderCertificateResponse { certificate_b64: cert_b64, trust_root_b64: trust_root_b64.clone(), expires_at_ms: expires },
+            trust_root_b64,
+        )
+    }
+
+    #[tokio::test]
+    async fn alice_to_bob_sealed_sender_round_trip() {
+        let server_url = normalize_server_url(Some("ws://127.0.0.1:8787/ws".to_string()));
+
+        // Two real identities.
+        let alice = create_identity("alice-passphrase", "Alice").unwrap();
+        let bob = create_identity("bob-passphrase", "Bob").unwrap();
+        let alice_material = material_from(&alice.secrets);
+        let bob_material = material_from(&bob.secrets);
+
+        let mut alice_store = MessagingStore::default();
+        let mut bob_store = MessagingStore::default();
+
+        // Bob's receive route — its mailbox id is the address Alice will send to.
+        let bob_route = new_local_route(server_url.clone(), "pending_invite".to_string(), None).unwrap();
+        // Bob's PQXDH Kyber prekey (part of his connection code).
+        let bob_kyber = signal_protocol_engine::ensure_local_kyber_prekey(&bob.blob, &bob_material, &mut bob_store).unwrap();
+
+        // Bob's connection-code payload, turned into Alice's view of Bob.
+        let bob_opk = &bob.blob.opks_public[0];
+        let payload = InvitePayload {
+            v: 1,
+            protocol: PROTOCOL_SIGNAL.to_string(),
+            display_name: "Bob".to_string(),
+            mailbox_id: bob_route.mailbox_id.clone(),
+            delivery_token: bob_route.delivery_token.clone(),
+            server_url: server_url.clone(),
+            device_id: DEVICE_ID,
+            identity_public_b64: STANDARD_NO_PAD.encode(&bob.blob.public_key),
+            registration_id: bob.blob.registration_id as u32,
+            signed_prekey_id: bob.blob.signed_prekey_id,
+            signed_prekey_public_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_public),
+            signed_prekey_signature_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_signature),
+            opk_id: Some(bob_opk.id),
+            opk_public_b64: Some(STANDARD_NO_PAD.encode(&bob_opk.public_key)),
+            kyber_prekey_id: Some(bob_kyber.id),
+            kyber_prekey_public_b64: Some(bob_kyber.public_b64.clone()),
+            kyber_prekey_signature_b64: Some(bob_kyber.signature_b64.clone()),
+            created_at_ms: now_ms(),
+        };
+        let bob_contact = contact_from_payload(payload, &alice.blob.public_key).unwrap();
+
+        // Alice's sender route + a matching relay-issued certificate.
+        let alice_route = new_local_route(server_url.clone(), contact_route_scope(&bob_contact.id), None).unwrap();
+        let (cert, trust_root_b64) = mint_cert(&alice_route.sealed_sender_cert_public_b64, &alice_route.mailbox_id);
+
+        // Alice encrypts a sealed-sender text for Bob (X3DH establishes the session).
+        let sent_at = now_ms();
+        let encrypted = signal_protocol_engine::encrypt_for_contact(
+            &alice.blob,
+            &alice_material,
+            &bob_contact,
+            &alice_route,
+            &alice_route,
+            &mut alice_store,
+            "text",
+            "hello bob — this is end to end",
+            "msg-roundtrip-1",
+            sent_at,
+            &cert,
+            false,
+            None,
+        ).await.expect("alice encrypt");
+        assert!(!encrypted.sealed_sender.is_empty());
+
+        // Bob decrypts it from his receive route, validating the certificate against
+        // the trust root Alice's relay would have pinned.
+        let decrypted = signal_protocol_engine::decrypt_sealed_sender_message(
+            &bob.blob,
+            &bob_material,
+            &mut bob_store,
+            &bob_route,
+            "srv_test",
+            &trust_root_b64,
+            &encrypted.sealed_sender,
+        ).await.expect("bob decrypt");
+
+        // The plaintext, the message id, and the kind all round-tripped.
+        assert_eq!(decrypted.message.body, "hello bob — this is end to end");
+        assert_eq!(decrypted.message.kind, "text");
+        assert_eq!(decrypted.message.message_id, "msg-roundtrip-1");
+        assert_eq!(decrypted.message.sent_at_ms, sent_at);
+        // Bob learned Alice's STABLE identity from inside the sealed envelope.
+        assert_eq!(decrypted.contact.identity_public_b64, STANDARD_NO_PAD.encode(&alice.blob.public_key));
+        assert_eq!(decrypted.contact.display_name.as_deref(), Some("Alice"));
+        // The prekey message consumed exactly Bob's advertised one-time prekey.
+        assert_eq!(decrypted.consumed_opk_ids, vec![bob_opk.id]);
+        // Bob persisted a Signal session for the conversation.
+        assert!(!bob_store.signal_sessions.is_empty(), "a ratchet session should be stored");
+    }
+
+    #[tokio::test]
+    async fn tampered_sealed_sender_is_rejected() {
+        // Integrity: flipping a byte of the sealed envelope must fail decryption,
+        // never silently surface altered plaintext.
+        let server_url = normalize_server_url(Some("ws://127.0.0.1:8787/ws".to_string()));
+        let alice = create_identity("a", "Alice").unwrap();
+        let bob = create_identity("b", "Bob").unwrap();
+        let alice_material = material_from(&alice.secrets);
+        let bob_material = material_from(&bob.secrets);
+        let mut alice_store = MessagingStore::default();
+        let mut bob_store = MessagingStore::default();
+
+        let bob_route = new_local_route(server_url.clone(), "pending_invite".to_string(), None).unwrap();
+        let bob_kyber = signal_protocol_engine::ensure_local_kyber_prekey(&bob.blob, &bob_material, &mut bob_store).unwrap();
+        let bob_opk = &bob.blob.opks_public[0];
+        let payload = InvitePayload {
+            v: 1, protocol: PROTOCOL_SIGNAL.to_string(), display_name: "Bob".to_string(),
+            mailbox_id: bob_route.mailbox_id.clone(), delivery_token: bob_route.delivery_token.clone(),
+            server_url: server_url.clone(), device_id: DEVICE_ID,
+            identity_public_b64: STANDARD_NO_PAD.encode(&bob.blob.public_key),
+            registration_id: bob.blob.registration_id as u32,
+            signed_prekey_id: bob.blob.signed_prekey_id,
+            signed_prekey_public_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_public),
+            signed_prekey_signature_b64: STANDARD_NO_PAD.encode(&bob.blob.signed_prekey_signature),
+            opk_id: Some(bob_opk.id), opk_public_b64: Some(STANDARD_NO_PAD.encode(&bob_opk.public_key)),
+            kyber_prekey_id: Some(bob_kyber.id), kyber_prekey_public_b64: Some(bob_kyber.public_b64.clone()),
+            kyber_prekey_signature_b64: Some(bob_kyber.signature_b64.clone()), created_at_ms: now_ms(),
+        };
+        let bob_contact = contact_from_payload(payload, &alice.blob.public_key).unwrap();
+        let alice_route = new_local_route(server_url.clone(), contact_route_scope(&bob_contact.id), None).unwrap();
+        let (cert, trust_root_b64) = mint_cert(&alice_route.sealed_sender_cert_public_b64, &alice_route.mailbox_id);
+
+        let mut encrypted = signal_protocol_engine::encrypt_for_contact(
+            &alice.blob, &alice_material, &bob_contact, &alice_route, &alice_route,
+            &mut alice_store, "text", "secret", "m", now_ms(), &cert, false, None,
+        ).await.unwrap();
+        // Corrupt the ciphertext.
+        let last = encrypted.sealed_sender.len() - 1;
+        encrypted.sealed_sender[last] ^= 0x01;
+
+        let result = signal_protocol_engine::decrypt_sealed_sender_message(
+            &bob.blob, &bob_material, &mut bob_store, &bob_route, "srv_test",
+            &trust_root_b64, &encrypted.sealed_sender,
+        ).await;
+        assert!(result.is_err(), "a tampered sealed-sender message must not decrypt");
     }
 }
