@@ -153,6 +153,17 @@ function defaultServerName(settings: AppSettings): string {
   return "No relay selected";
 }
 
+// Generating a connection code outlives IdentitySection: the upload to the relay
+// can take a minute over Tor, and switching settings section unmounts us. Track
+// the in-flight generation at module scope so a remount restores the spinner
+// instead of showing an idle button the user is tempted to press again.
+let codeGenerationInFlight = false;
+const codeGenerationListeners = new Set<(inFlight: boolean) => void>();
+function setCodeGenerationInFlight(inFlight: boolean) {
+  codeGenerationInFlight = inFlight;
+  codeGenerationListeners.forEach(listener => listener(inFlight));
+}
+
 function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInviteCodes, defaultServerUrl, defaultServerName, privateServers }: {
   displayName: string;
   onChangeName: (name: string) => void;
@@ -166,7 +177,8 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
   const [draft, setDraft] = useState(displayName);
   const [copied, setCopied] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string>("");
-  const [generating, setGenerating] = useState(false);
+  const [generating, setGenerating] = useState(codeGenerationInFlight);
+  const mounted = useRef(true);
 
   // Change-password modal state
   const [showPwModal, setShowPwModal] = useState(false);
@@ -218,28 +230,43 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
     setEditing(false);
   };
 
-  useEffect(() => {
+  // Re-read the backend list rather than splicing into the `inviteCodes` prop:
+  // a generation that finishes after a remount would otherwise append onto the
+  // stale array captured when the click happened.
+  const refreshCodes = () =>
     invoke<Array<{ id: string; code: string; created_at: number; server_url: string; server_name?: string; reusable?: boolean }>>("messaging_list_connection_codes")
-      .then(codes => onChangeInviteCodes(codes.map(c => ({ id: c.id, code: c.code, createdAt: c.created_at, serverUrl: c.server_url, serverName: c.server_name, reusable: c.reusable }))))
+      .then(codes => {
+        if (!mounted.current) return;
+        onChangeInviteCodes(codes.map(c => ({ id: c.id, code: c.code, createdAt: c.created_at, serverUrl: c.server_url, serverName: c.server_name, reusable: c.reusable })));
+      })
       .catch(() => { });
+
+  useEffect(() => {
+    mounted.current = true;
+    codeGenerationListeners.add(setGenerating);
+    void refreshCodes();
+    return () => {
+      mounted.current = false;
+      codeGenerationListeners.delete(setGenerating);
+    };
   }, []);
 
   const addCode = async () => {
-    if (generating) return;
-    setGenerating(true);
+    if (codeGenerationInFlight) return;
+    setCodeGenerationInFlight(true);
     setSaveError("");
     try {
-      const next = await invoke<{ id: string; code: string; created_at: number; server_url: string; server_name?: string; reusable?: boolean }>("messaging_generate_connection_code", {
+      await invoke<{ id: string; code: string; created_at: number; server_url: string; server_name?: string; reusable?: boolean }>("messaging_generate_connection_code", {
         serverUrl: defaultServerUrl,
         serverName: defaultServerName,
         reusable: reusableCode,
       });
-      onChangeInviteCodes([...inviteCodes, { id: next.id, code: next.code, createdAt: next.created_at, serverUrl: next.server_url, serverName: next.server_name, reusable: next.reusable }]);
+      await refreshCodes();
       invoke("messaging_connect_all").catch(() => { });
     } catch (e) {
-      setSaveError(typeof e === "string" ? e : "Could not generate connection code");
+      if (mounted.current) setSaveError(typeof e === "string" ? e : "Could not generate connection code");
     } finally {
-      setGenerating(false);
+      setCodeGenerationInFlight(false);
     }
   };
 

@@ -195,6 +195,13 @@
   word-break: break-word;
 }
 
+/* Keep the sender's line breaks and runs of spaces; pre-wrap still soft-wraps
+   long lines to the bubble width. Scoped to text bubbles so it cannot introduce
+   stray whitespace into the file-attachment layout. */
+.msg-text {
+  white-space: pre-wrap;
+}
+
 .bubble-mine {
   background: var(--bubble-mine);
   color: var(--bubble-mine-text);

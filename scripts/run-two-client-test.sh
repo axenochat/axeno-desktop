@@ -17,13 +17,21 @@ set -Eeuo pipefail
 #   5. Launch both Tauri dev clients, each in its own terminal
 #
 # Flags:
-#   --reset   wipe both clients' app data before running (default: keep it)
+#   --reset     wipe both clients' app data before running (default: keep it)
+#   --release   compile the Rust backend with optimizations. Slow to build (each
+#               client compiles its own release target, and the first one is a
+#               long wait) but this is the only way to get timings that reflect
+#               a shipped build. A debug backend compiles sha2, arti and
+#               libsignal unoptimized, which inflates connection-code
+#               proof-of-work, Tor circuit setup and message crypto by ~10x.
 
 RESET=0
+RELEASE=0
 for arg in "$@"; do
   case "$arg" in
     --reset) RESET=1 ;;
-    -h|--help) sed -n '4,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --release) RELEASE=1 ;;
+    -h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'unknown option: %s (use --help)\n' "$arg" >&2; exit 1 ;;
   esac
 done
@@ -83,6 +91,13 @@ if [[ "$RESET" -eq 1 ]]; then
   rm -rf "$DATA_A" "$CONF_A" "$DATA_B" "$CONF_B"
 else
   log "Keeping existing client app data (use --reset to wipe)"
+fi
+
+if [[ "$RELEASE" -eq 1 ]]; then
+  log "Release mode: Rust backend compiled with optimizations"
+  warn "Each client builds its own release target; the first build is a long wait"
+else
+  log "Debug mode: Rust backend is unoptimized (use --release for realistic timings)"
 fi
 
 log "Syncing $CLIENT_A -> $CLIENT_B (preserving its node_modules/target)"
@@ -194,9 +209,15 @@ EOF
   fi
 }
 
+# The `--` is what makes npm forward the rest to the Tauri CLI. Without it npm
+# consumes `--release` as its own flag and you silently get a debug build.
+DEV_CMD="npm run tauri -- dev"
+if [[ "$RELEASE" -eq 1 ]]; then
+  DEV_CMD="$DEV_CMD --release"
+fi
+
 # WEBKIT_DISABLE_COMPOSITING_MODE is a Linux WebKitGTK workaround; on macOS
 # (WebKit/WKWebView) it is unnecessary, so only prepend it on Linux.
-DEV_CMD="npm run tauri dev"
 if [[ "$OS" != "Darwin" ]]; then
   DEV_CMD="WEBKIT_DISABLE_COMPOSITING_MODE=1 $DEV_CMD"
 fi

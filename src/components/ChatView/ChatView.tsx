@@ -39,10 +39,12 @@ function messageStatusLabel(status?: string): string {
 // Render a message body as plain text with clickable http(s) links. Links never
 // navigate directly; they call onOpenLink, which the app gates behind a
 // deanonymisation warning before handing the URL to the OS opener.
+// The wrapper carries white-space: pre-wrap so the line breaks the sender typed
+// survive; without it the browser collapses them into single spaces.
 function MessageText({ text, onOpenLink }: { text: string; onOpenLink: (url: string) => void }) {
   const segments = linkifySegments(text);
   return (
-    <>
+    <span className="msg-text">
       {segments.map((seg, i) =>
         seg.type === "link" ? (
           <span
@@ -60,7 +62,7 @@ function MessageText({ text, onOpenLink }: { text: string; onOpenLink: (url: str
           <Fragment key={i}>{seg.value}</Fragment>
         )
       )}
-    </>
+    </span>
   );
 }
 
@@ -126,7 +128,9 @@ export default function ChatView({ contact, messages, fileProgress, onOpenChatSe
   useEffect(autosize, [input]);
 
   const send = () => {
-    const text = input.trim();
+    // Normalise CRLF/CR pasted from other apps to plain LF — the bubble renders
+    // with pre-wrap, where a stray CR shows up as an extra blank line.
+    const text = input.replace(/\r\n?/g, "\n").trim();
     if (!text) return;
     setSendError("");
     setInput("");

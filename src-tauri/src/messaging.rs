@@ -43,6 +43,10 @@ const DEVICE_ID: u32 = 1;
 /// `MAX_BUNDLE_TTL_MS`, which is kept in sync at the same value; the client
 /// requests this TTL when uploading the invite bundle.
 const CONNECTION_CODE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// An invite whose bundle upload never finished (app quit or crashed mid-generate)
+/// can never be published, but it still holds a local route. Purge it once no
+/// plausible upload could still be in flight.
+const UNPUBLISHED_INVITE_GRACE_MS: u64 = 30 * 60 * 1000;
 const VERIFY_PREFIX: &str = "axv1_";
 const VERIFY_CODE_TTL_MS: u64 = 10 * 60 * 1000;
 const SIGNED_PREKEY_ROTATION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -233,6 +237,16 @@ struct FileSendSource {
     total_chunks: u32,
 }
 
+/// A receipt we still owe the sender of an inbound message. See
+/// [`MessagingStore::pending_delivery_acks`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeliveryAck {
+    pub contact_id: String,
+    /// The inbound message's id — the body of the `delivery_ack` payload.
+    pub message_id: String,
+    pub created_at_ms: u64,
+}
+
 fn default_store_version() -> u16 { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,6 +261,12 @@ pub struct MessagingStore {
     #[serde(default)] pub local_profile: Option<LocalProfile>,
     #[serde(default)] pub local_routes: Vec<LocalRoute>,
     #[serde(default)] pub pending_relay_retires: Vec<LocalRoute>,
+    /// Delivery acks we owe our peers. Recorded durably the moment an inbound
+    /// text/file is stored, and cleared only once the ack has actually been
+    /// transmitted. Without this an ack that is skipped (route_sync in progress)
+    /// or that fails in flight is lost forever, stranding the sender's message on
+    /// "queued" even though it was delivered and displayed.
+    #[serde(default)] pub pending_delivery_acks: Vec<PendingDeliveryAck>,
     #[serde(default)] pub used_opk_ids: Vec<u32>,
     #[serde(default)] pub server_trust_roots: HashMap<String, String>,
     #[serde(default)] pub private_servers: Vec<PrivateServerSetting>,
@@ -379,6 +399,13 @@ pub struct PendingInvite {
     pub expires_at_ms: u64,
     #[serde(default)]
     pub reusable: bool,
+    /// False while the encrypted prekey bundle is still being uploaded to the
+    /// relay. An unpublished invite is unresolvable — a peer who scans the code
+    /// gets bundle_not_found — so it must never be surfaced as a usable code.
+    /// Records written before this field existed were only persisted on success,
+    /// so they default to published.
+    #[serde(default = "default_true")]
+    pub published: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1297,7 +1324,28 @@ fn queue_relay_retire(store: &mut MessagingStore, route: LocalRoute) {
 
 fn cleanup_expired_routes(store: &mut MessagingStore) {
     let now = now_ms();
-    store.pending_invites.retain(|p| p.expires_at_ms > now);
+    let (kept_invites, dropped_invites): (Vec<PendingInvite>, Vec<PendingInvite>) =
+        std::mem::take(&mut store.pending_invites)
+            .into_iter()
+            .partition(|p| {
+                p.expires_at_ms > now
+                    && (p.published || p.created_at_ms.saturating_add(UNPUBLISHED_INVITE_GRACE_MS) > now)
+            });
+    store.pending_invites = kept_invites;
+
+    // An invite dropped before it ever published leaves a mailbox nothing can
+    // ever arrive on, since its code was never resolvable. Retire that route
+    // along with the expired ones below.
+    let orphan_route_ids: Vec<String> = dropped_invites
+        .iter()
+        .filter(|p| !p.published)
+        .filter_map(|p| p.route_id.clone())
+        .collect();
+    for route in &mut store.local_routes {
+        if orphan_route_ids.iter().any(|rid| rid == &route.id) {
+            route.active = false;
+        }
+    }
 
     let mut keep = Vec::with_capacity(store.local_routes.len());
     let routes = std::mem::take(&mut store.local_routes);
@@ -1542,6 +1590,38 @@ fn sender_route_for_contact(store: &MessagingStore, contact_id: &str, fallback: 
 
 fn route_is_retiring_invite(route: &LocalRoute) -> bool {
     route.scope.starts_with("retiring_invite:")
+}
+
+/// An invite mailbox that is still open to strangers: a code that has not been
+/// redeemed yet, or a reusable one that stays live for further redemptions.
+fn route_is_open_invite(route: &LocalRoute) -> bool {
+    route.active && route.scope == "pending_invite"
+}
+
+/// How many mailbox groups a logging relay could NOT already link together from
+/// delivery metadata alone.
+///
+/// This is the unit the connect/close stagger must key off. The relay observes
+/// authenticated-sender-mailbox -> destination-mailbox on the warm send path (see
+/// `send_envelope_once` in transport.rs), so any two of our mailboxes that share a
+/// correspondent are already associated and spreading their connect times apart
+/// hides nothing — it only costs latency. Every route belonging to one contact is
+/// such a group: the durable route, the retiring invite it replaced, and any
+/// sender hold all exchange with that same peer mailbox.
+///
+/// What the relay genuinely cannot link is mailboxes with no correspondent in
+/// common: routes for different contacts, and an OPEN invite mailbox, which
+/// carries no traffic at all until someone redeems it and so has no metadata to
+/// betray it. For those, simultaneous appearance at unlock is the only grouping
+/// signal there is, and the stagger is the only thing removing it.
+///
+/// Counting routes (the original) staggered already-linked mailboxes for no gain,
+/// which is why the inviting side of a fresh pairing staggered and the joining
+/// side did not. Counting contacts would drop the open-invite case, which is the
+/// one place the stagger is doing irreplaceable work.
+fn linkability_class_count(store: &MessagingStore) -> usize {
+    store.contacts.len()
+        + store.local_routes.iter().filter(|r| route_is_open_invite(r)).count()
 }
 
 fn promote_local_route_after_incoming(
@@ -2148,6 +2228,8 @@ pub async fn generate_connection_code(
             created_at_ms: created,
             expires_at_ms: expires,
             reusable,
+            // Not usable until the bundle upload below succeeds.
+            published: false,
         };
         let route_for_connect = route.clone();
         store.local_routes.push(route);
@@ -2191,6 +2273,20 @@ pub async fn generate_connection_code(
         return Err(format!("failed to upload invite bundle to relay: {e}"));
     }
 
+    // The bundle is live on the relay, so the code is finally resolvable. Only
+    // now does it become visible to list_connection_codes — until this point a
+    // UI that re-read the store (e.g. after the settings section was unmounted
+    // and remounted) would have shown a code peers cannot redeem.
+    {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
+        match store.pending_invites.iter_mut().find(|p| p.id == response.id) {
+            Some(invite) => invite.published = true,
+            None => return Err("connection code was removed before it finished publishing".to_string()),
+        }
+        save_store_with_key(&app, &store, &store_key)?;
+    }
+
     Ok(response)
 }
 
@@ -2199,7 +2295,12 @@ pub async fn list_connection_codes(app: AppHandle, session: &AppSessionState) ->
     let (store_key, legacy_store_key) = store_keys(session).await?;
     let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
     cleanup_expired_routes(&mut store);
-    let out = store.pending_invites.iter().map(|p| connection_code_response(&store, p)).collect();
+    // Skip invites whose bundle upload is still in flight — they are not yet
+    // redeemable, so showing them would hand the user a dead code.
+    let out = store.pending_invites.iter()
+        .filter(|p| p.published)
+        .map(|p| connection_code_response(&store, p))
+        .collect();
     save_store_with_key(&app, &store, &store_key)?;
     Ok(out)
 }
@@ -2539,7 +2640,7 @@ pub async fn snapshot(app: AppHandle, session: &AppSessionState, runtime: &Messa
 
 pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_state: &transport::TransportState, tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>) -> Result<u64, String> {
     let (store_key, legacy_store_key) = store_keys(session).await?;
-    let (routes, retire_routes, route_sync_contacts) = {
+    let (routes, retire_routes, route_sync_contacts, linkability_classes) = {
         let _store_guard = session.messaging_store_lock.lock().await;
         let mut store = load_store_with_keys(&app, &store_key, &legacy_store_key)?;
         cleanup_expired_routes(&mut store);
@@ -2560,8 +2661,9 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
         }
         let routes: Vec<LocalRoute> = store.local_routes.iter().filter(|r| r.active).cloned().collect();
         let retire_routes = store.pending_relay_retires.clone();
+        let linkability_classes = linkability_class_count(&store);
         save_store_with_key(&app, &store, &store_key)?;
-        (routes, retire_routes, route_sync_contacts)
+        (routes, retire_routes, route_sync_contacts, linkability_classes)
     };
 
     // Retire old mailboxes in the background so we don't block live connection
@@ -2602,13 +2704,16 @@ pub async fn connect_all(app: AppHandle, session: &AppSessionState, transport_st
     // Pre-compute all delays so we can return the actual max to the frontend for
     // an accurate countdown (rather than always showing the theoretical max).
     //
-    // Staggering only buys unlinkability when there are at least two mailboxes to
-    // spread apart: the whole point is to stop a logging relay grouping several
-    // mailboxes that appear together at unlock. With a single route (e.g. just one
-    // contact) there is nothing to decorrelate it against, so jitter would only
-    // delay the lone connection for no privacy gain — connect it immediately, the
-    // same as when the user has turned the obfuscation off.
-    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() && routes.len() >= 2 {
+    // Stagger exactly when there is something a logging relay could not already
+    // work out for itself — two or more mailbox groups it cannot link from
+    // delivery metadata. See `linkability_class_count` for why that, and not the
+    // route or contact count, is the right unit.
+    //
+    // Publish the same decision to the transport layer, which sees only mailboxes
+    // and so cannot make this call itself when staggering the close on quit.
+    let decorrelation_worthwhile = linkability_classes >= 2;
+    transport::set_stagger_multi_peer(decorrelation_worthwhile);
+    let delays: Vec<std::time::Duration> = if stagger_connections_enabled() && decorrelation_worthwhile {
         routes.iter().map(|_| jittered_connect_delay()).collect()
     } else {
         routes.iter().map(|_| std::time::Duration::ZERO).collect()
@@ -3030,6 +3135,17 @@ const RESEND_PENDING_MIN_AGE_MS: u64 = 60 * 1000;
 /// Cap how many stalled sends a single sweep drains, so a large backlog can't
 /// fan out into a burst of concurrent Tor sends. The next sweep takes the rest.
 const RESEND_MAX_PER_SWEEP: usize = 16;
+/// How long we keep retrying a delivery ack we could not transmit. Long enough to
+/// outlast an offline peer or a long Tor outage; finite so a contact that never
+/// comes back doesn't leave an entry retried forever.
+const PENDING_DELIVERY_ACK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Cap the acks drained per sweep, matching [`RESEND_MAX_PER_SWEEP`], so a
+/// backlog cannot fan out into a burst of concurrent Tor sends.
+const DELIVERY_ACK_MAX_PER_SWEEP: usize = 16;
+/// Leave the inbound path's own attempt time to finish before the sweep retries
+/// an ack. This also keeps the sweep clear of the route_sync PreKey exchange that
+/// caused the ack to be deferred in the first place.
+const DELIVERY_ACK_MIN_AGE_MS: u64 = 45 * 1000;
 
 /// Re-transmit outgoing TEXT messages that never reached the relay: status
 /// `send_failed`, or `relay_pending` for longer than [`RESEND_PENDING_MIN_AGE_MS`]
@@ -3104,7 +3220,57 @@ pub async fn retry_pending_sends(
             resent += 1;
         }
     }
+
+    flush_pending_delivery_acks(app, session, transport_state, tor_client).await;
     Ok(())
+}
+
+/// Transmit delivery acks that were deferred or lost on the inbound path. This is
+/// what stops a delivered message from sitting on "queued" forever: the sender
+/// only leaves `relay_queued` when our ack reaches it, and the inbound path's
+/// single fire-and-forget attempt is not always enough.
+async fn flush_pending_delivery_acks(
+    app: AppHandle,
+    session: &AppSessionState,
+    transport_state: &transport::TransportState,
+    tor_client: Arc<Mutex<Option<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>>,
+) {
+    let Ok((store_key, legacy_store_key)) = store_keys(session).await else { return; };
+    let due: Vec<PendingDeliveryAck> = {
+        let _store_guard = session.messaging_store_lock.lock().await;
+        let Ok(mut store) = load_store_with_keys(&app, &store_key, &legacy_store_key) else { return; };
+        let now = now_ms();
+        let before = store.pending_delivery_acks.len();
+        store.pending_delivery_acks
+            .retain(|a| a.created_at_ms.saturating_add(PENDING_DELIVERY_ACK_TTL_MS) > now);
+        if store.pending_delivery_acks.len() != before {
+            let _ = save_store_with_key(&app, &store, &store_key);
+        }
+        store.pending_delivery_acks.iter()
+            .filter(|a| now.saturating_sub(a.created_at_ms) >= DELIVERY_ACK_MIN_AGE_MS)
+            .take(DELIVERY_ACK_MAX_PER_SWEEP)
+            .cloned()
+            .collect()
+    };
+
+    for ack in due {
+        let sent = send_signal_payload_internal(
+            app.clone(),
+            session,
+            transport_state,
+            tor_client.clone(),
+            ack.contact_id.clone(),
+            "delivery_ack",
+            ack.message_id.clone(),
+            false,
+            false,
+            None,
+            None,
+        ).await.is_ok();
+        if sent {
+            clear_delivery_ack(&app, session, &ack.contact_id, &ack.message_id).await;
+        }
+    }
 }
 
 /// Reset a stalled/failed outgoing message back to `relay_pending` so the UI shows
@@ -3773,6 +3939,13 @@ pub async fn handle_incoming_envelope(
     if needs_route_sync {
         route_sync_contact_after_save = Some(contact_id.clone());
     }
+    // Record the ack we now owe the sender BEFORE the store is saved, so it
+    // survives whatever happens to the send attempt below — a route_sync
+    // deferral, a dead circuit, or the process exiting. `retry_pending_sends`
+    // drains anything left behind.
+    if let Some(ref ack_msg_id) = send_delivery_ack_for_msg_id {
+        queue_delivery_ack(&mut store, &contact_id, ack_msg_id, received_at);
+    }
     if decrypted.message.kind == "route_sync" {
         route_sync_ack_contact_after_save = Some(contact_id.clone());
     }
@@ -3800,16 +3973,16 @@ pub async fn handle_incoming_envelope(
     let _ = transport::ack_envelopes(transport_state, server_id.clone(), vec![envelope.id]).await;
     runtime.seen_envelopes.lock().await.insert(envelope_key.clone(), now_ms());
     runtime.failed_envelopes.lock().await.remove(&envelope_key);
-    // Capture before the if-let blocks below move these options.
-    let doing_route_sync = route_sync_contact_after_save.is_some();
-    if let Some(contact_id) = route_sync_contact_after_save {
-        let _ = send_route_control(app.clone(), session, transport_state, tor_client.clone(), contact_id, "route_sync").await;
-    }
-    if let Some(contact_id) = route_sync_ack_contact_after_save {
-        let _ = send_route_control(app.clone(), session, transport_state, tor_client.clone(), contact_id, "route_sync_ack").await;
-    }
-    // Tell the frontend to upgrade the outgoing message that just got acked by the peer.
+    // Surface the message to the UI BEFORE any outbound work. Everything the
+    // frontend needs is already durably saved above, so these emits are pure
+    // notification and nothing below can invalidate them. They used to sit after
+    // the route_sync sends, which are full Tor round trips that can each fall
+    // back to a freshly built circuit — so a received message stayed invisible
+    // until OUR OWN next send completed. That made outbound latency masquerade
+    // as inbound latency, worst exactly when a conversation is new and both
+    // route-control exchanges are still settling.
     if let Some(acked_id) = delivery_ack_upgraded_msg_id {
+        // Tell the frontend to upgrade the outgoing message the peer just acked.
         let _ = app.emit("axeno-send-receipt", transport::SendReceipt {
             server_id: server_id.clone(),
             id: Uuid::new_v4(),
@@ -3820,19 +3993,62 @@ pub async fn handle_incoming_envelope(
     if let Some(msg) = msg {
         let _ = app.emit("axeno-message", IncomingMessageEvent { contact_id: contact_id.clone(), message: msg });
     }
+
+    // Capture before the if-let blocks below move these options.
+    let doing_route_sync = route_sync_contact_after_save.is_some();
+    if let Some(contact_id) = route_sync_contact_after_save {
+        let _ = send_route_control(app.clone(), session, transport_state, tor_client.clone(), contact_id, "route_sync").await;
+    }
+    if let Some(contact_id) = route_sync_ack_contact_after_save {
+        let _ = send_route_control(app.clone(), session, transport_state, tor_client.clone(), contact_id, "route_sync_ack").await;
+    }
     // Send a delivery_ack so the sender's relay_queued status upgrades to relay_received.
     // Skip when route_sync is active: that path already sends a PreKey message to establish
     // the session. A concurrent delivery_ack would create a second conflicting PreKey
-    // exchange and corrupt the Signal session for the new contact.
+    // exchange and corrupt the Signal session for the new contact. The ack is already
+    // queued in the store, so the next `retry_pending_sends` sweep delivers it once the
+    // session has settled — it is deferred here, never dropped.
     if let Some(original_msg_id) = send_delivery_ack_for_msg_id {
         if !doing_route_sync {
-            let _ = send_signal_payload_internal(
+            let sent = send_signal_payload_internal(
                 app.clone(), session, transport_state, tor_client.clone(),
-                contact_id, "delivery_ack", original_msg_id, false, false, None, None,
-            ).await;
+                contact_id.clone(), "delivery_ack", original_msg_id.clone(), false, false, None, None,
+            ).await.is_ok();
+            if sent {
+                clear_delivery_ack(&app, session, &contact_id, &original_msg_id).await;
+            }
         }
     }
     Ok(())
+}
+
+/// Queue a delivery ack we owe `contact_id` for `message_id`, replacing any
+/// existing entry for the same message so a re-delivered envelope cannot stack
+/// duplicates.
+fn queue_delivery_ack(store: &mut MessagingStore, contact_id: &str, message_id: &str, now: u64) {
+    store.pending_delivery_acks.retain(|a| {
+        a.created_at_ms.saturating_add(PENDING_DELIVERY_ACK_TTL_MS) > now
+            && !(a.contact_id == contact_id && a.message_id == message_id)
+    });
+    store.pending_delivery_acks.push(PendingDeliveryAck {
+        contact_id: contact_id.to_string(),
+        message_id: message_id.to_string(),
+        created_at_ms: now,
+    });
+}
+
+/// Drop a queued ack once it has actually been transmitted. Best-effort: if the
+/// store cannot be written the ack is simply re-sent by a later sweep, which the
+/// sender dedups by advancing its status monotonically.
+async fn clear_delivery_ack(app: &AppHandle, session: &AppSessionState, contact_id: &str, message_id: &str) {
+    let _store_guard = session.messaging_store_lock.lock().await;
+    let Ok((store_key, legacy_store_key)) = store_keys(session).await else { return; };
+    let Ok(mut store) = load_store_with_keys(app, &store_key, &legacy_store_key) else { return; };
+    let before = store.pending_delivery_acks.len();
+    store.pending_delivery_acks.retain(|a| !(a.contact_id == contact_id && a.message_id == message_id));
+    if store.pending_delivery_acks.len() != before {
+        let _ = save_store_with_key(app, &store, &store_key);
+    }
 }
 
 
@@ -4910,6 +5126,91 @@ mod route_tests {
         assert!(store_cache_get(&key_a).is_none(), "cleared cache misses");
     }
 
+    // The stagger guards must key off contacts, not routes. Redeeming a single-use
+    // code leaves the INVITER holding two active mailboxes for one conversation
+    // (the retiring invite route plus the fresh durable route), while the joiner
+    // holds one — which is exactly why counting routes made staggering fire for
+    // only one side of a brand-new pairing.
+    #[test]
+    fn redeemed_invite_leaves_the_inviter_with_two_routes_for_one_contact() {
+        let url = "ws://r.onion/ws";
+        let mut store = MessagingStore::default();
+
+        // The inviter generated a single-use connection code: one pending_invite route.
+        let invite = new_local_route(
+            url.to_string(),
+            "pending_invite".to_string(),
+            Some(now_ms() + CONNECTION_CODE_TTL_MS),
+        )
+        .unwrap();
+        let invite_id = invite.id.clone();
+        store.local_routes.push(invite);
+        assert_eq!(store.local_routes.iter().filter(|r| r.active).count(), 1);
+
+        // A friend redeems it and their first message arrives, promoting the
+        // invite route into a durable per-contact route.
+        store.contacts.push(test_contact("c1", url, Some(invite_id.clone())));
+        let (fresh, needs_route_sync) =
+            promote_local_route_after_incoming(&mut store, &invite_id, "c1", false).unwrap();
+        assert!(needs_route_sync);
+        assert!(fresh.is_some(), "promotion should mint a durable contact route");
+
+        // One contact, but two live mailboxes: the retiring invite route keeps its
+        // expiry cleared, so it stays active until the peer acks the new mailbox.
+        assert_eq!(store.contacts.len(), 1);
+        let active: Vec<&LocalRoute> = store.local_routes.iter().filter(|r| r.active).collect();
+        assert_eq!(active.len(), 2);
+        let invite_route = store.local_routes.iter().find(|r| r.id == invite_id).unwrap();
+        assert!(route_is_retiring_invite(invite_route));
+        assert_eq!(invite_route.expires_at_ms, None);
+
+        // ...but those two mailboxes both correspond with the same peer, so the
+        // relay can already associate them. Nothing left to decorrelate: one class.
+        assert_eq!(linkability_class_count(&store), 1);
+    }
+
+    fn open_invite_route(url: &str) -> LocalRoute {
+        new_local_route(
+            url.to_string(),
+            "pending_invite".to_string(),
+            Some(now_ms() + CONNECTION_CODE_TTL_MS),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unredeemed_invite_mailbox_is_its_own_linkability_class() {
+        let url = "ws://r.onion/ws";
+        let mut store = MessagingStore::default();
+
+        // A lone unredeemed code has no traffic and no contact to be linked to,
+        // so on its own there is still nothing to correlate it against.
+        store.local_routes.push(open_invite_route(url));
+        assert_eq!(linkability_class_count(&store), 1);
+
+        // Add a real conversation and the open invite becomes the one thing the
+        // relay could NOT otherwise link to it — appearance timing is the only
+        // signal, so the stagger has to stay on.
+        store.contacts.push(test_contact("c1", url, None));
+        assert_eq!(linkability_class_count(&store), 2);
+
+        // A second outstanding code is another unlinkable mailbox again.
+        store.local_routes.push(open_invite_route(url));
+        assert_eq!(linkability_class_count(&store), 3);
+    }
+
+    #[test]
+    fn separate_contacts_are_always_separate_linkability_classes() {
+        let url = "ws://r.onion/ws";
+        let mut store = MessagingStore::default();
+        store.contacts.push(test_contact("c1", url, None));
+        assert_eq!(linkability_class_count(&store), 1);
+        // Routes for different peers share no correspondent, so the relay cannot
+        // link them from metadata. This is the case the stagger exists for.
+        store.contacts.push(test_contact("c2", url, None));
+        assert_eq!(linkability_class_count(&store), 2);
+    }
+
     #[test]
     fn pending_invite_promotion_never_uses_invite_as_its_own_replacement() {
         let server_url = LOOPBACK_RELAY_URL.to_string();
@@ -5024,6 +5325,30 @@ mod status_ladder_tests {
         let mut m = mine("relay_received");
         advance_mine_status(&mut m, "relay_queued");
         assert_eq!(m.status, "relay_received");
+    }
+
+    #[test]
+    fn queued_delivery_ack_is_recorded_once_per_message() {
+        // A re-delivered envelope re-queues the same ack; it must not stack.
+        let mut store = MessagingStore::default();
+        queue_delivery_ack(&mut store, "c", "m1", 1_000);
+        queue_delivery_ack(&mut store, "c", "m1", 2_000);
+        queue_delivery_ack(&mut store, "c", "m2", 2_000);
+        assert_eq!(store.pending_delivery_acks.len(), 2);
+        let m1 = store.pending_delivery_acks.iter().find(|a| a.message_id == "m1").unwrap();
+        // Re-queuing refreshes the timestamp so the retry window restarts.
+        assert_eq!(m1.created_at_ms, 2_000);
+    }
+
+    #[test]
+    fn queued_delivery_acks_expire() {
+        // An ack for a peer that never came back must not be retried forever.
+        let mut store = MessagingStore::default();
+        queue_delivery_ack(&mut store, "c", "old", 1_000);
+        let later = 1_000 + PENDING_DELIVERY_ACK_TTL_MS + 1;
+        queue_delivery_ack(&mut store, "c", "new", later);
+        assert_eq!(store.pending_delivery_acks.len(), 1);
+        assert_eq!(store.pending_delivery_acks[0].message_id, "new");
     }
 }
 

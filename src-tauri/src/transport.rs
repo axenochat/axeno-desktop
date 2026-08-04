@@ -374,6 +374,20 @@ pub fn set_shutdown_jitter_max_ms(ms: u64) {
     SHUTDOWN_STAGGER_MAX_MS.store(ms.clamp(1_000, 60_000), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this client holds two or more mailbox groups a logging relay could
+/// not already link from delivery metadata — i.e. whether decorrelating their
+/// timing buys anything at all. Published by messaging `connect_all`, which is
+/// the only layer that can tell: the transport sees mailboxes, not which peer
+/// each belongs to, and several mailboxes routinely belong to one already-visible
+/// conversation (see `linkability_class_count` in messaging.rs). Defaults to true
+/// so a close that somehow precedes the first `connect_all` errs toward the
+/// private behaviour.
+static STAGGER_MULTI_PEER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_stagger_multi_peer(multi_peer: bool) {
+    STAGGER_MULTI_PEER.store(multi_peer, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn random_stagger_delay() -> Duration {
     let mut buf = [0u8; 8];
     if getrandom::getrandom(&mut buf).is_err() { return Duration::ZERO; }
@@ -394,12 +408,14 @@ pub async fn disconnect_all_staggered(app: &AppHandle, state: &TransportState) {
     let _ = app.emit("axeno-shutdown-progress", ShutdownProgress { closed: 0, total });
     if total == 0 { return; }
 
-    // Staggering only hides which mailboxes belong to one user when there are at
-    // least two of them dropping together. With a single connection there is
-    // nothing to decorrelate it against, so a random close delay would just stall
-    // quit for no privacy gain — close it immediately (mirrors the connect side's
-    // `routes.len() >= 2` guard in messaging `connect_all`).
-    let stagger = total >= 2;
+    // Staggering only hides which mailboxes belong to one user when at least two
+    // of them drop together AND the relay could not already link them from
+    // delivery metadata. With a single connection there is nothing to decorrelate
+    // against; with a single linkability group the association is already visible
+    // in the traffic. Either way a random close delay would just stall quit for
+    // no privacy gain — close immediately. Mirrors the connect side's guard in
+    // messaging `connect_all`, which is what publishes STAGGER_MULTI_PEER.
+    let stagger = total >= 2 && STAGGER_MULTI_PEER.load(std::sync::atomic::Ordering::Relaxed);
 
     let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut handles = Vec::new();
