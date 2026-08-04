@@ -14,7 +14,10 @@ type Section = "identity" | "servers" | "appearance" | "privacy" | "security" | 
 
 interface Props {
   settings: AppSettings;
-  onChange: (settings: AppSettings) => void;
+  // Accepts an updater so callbacks that fire long after the render that created
+  // them (notably the connection-code generation, which can take a minute over
+  // Tor) can merge into current state instead of writing back a stale snapshot.
+  onChange: React.Dispatch<React.SetStateAction<AppSettings>>;
   onClose: () => void;
   displayName: string;
   onChangeName: (name: string) => void;
@@ -45,7 +48,7 @@ export default function Settings({
         </nav>
 
         <main className="settings-content">
-          {section === "identity" && <IdentitySection displayName={displayName} onChangeName={onChangeName} inviteCodes={settings.inviteCodes} onChangeInviteCodes={(inviteCodes) => onChange({ ...settings, inviteCodes })} defaultServerUrl={defaultServerUrl(settings)} defaultServerName={defaultServerName(settings)} privateServers={settings.privateServers} />}
+          {section === "identity" && <IdentitySection displayName={displayName} onChangeName={onChangeName} inviteCodes={settings.inviteCodes} onChangeInviteCodes={(inviteCodes) => onChange(prev => ({ ...prev, inviteCodes }))} defaultServerUrl={defaultServerUrl(settings)} defaultServerName={defaultServerName(settings)} privateServers={settings.privateServers} />}
           {section === "servers" && <ServersSection settings={settings} onChange={onChange} />}
           {section === "appearance" && <AppearanceSection settings={settings} onChange={onChange} />}
           {section === "privacy" && <PrivacySection settings={settings} onChange={onChange} />}
@@ -157,11 +160,20 @@ function defaultServerName(settings: AppSettings): string {
 // can take a minute over Tor, and switching settings section unmounts us. Track
 // the in-flight generation at module scope so a remount restores the spinner
 // instead of showing an idle button the user is tempted to press again.
+//
+// The FAILURE has to outlive the component for the same reason. It used to live
+// in component state that a remount discarded, and it was only rendered inside
+// the "editing your display name" branch — so a generation that failed showed
+// nothing at all: the spinner just stopped and no code appeared, which is
+// indistinguishable from the success path silently not updating.
 let codeGenerationInFlight = false;
-const codeGenerationListeners = new Set<(inFlight: boolean) => void>();
-function setCodeGenerationInFlight(inFlight: boolean) {
+let codeGenerationError = "";
+interface CodeGenerationState { inFlight: boolean; error: string }
+const codeGenerationListeners = new Set<(state: CodeGenerationState) => void>();
+function publishCodeGeneration(inFlight: boolean, error: string) {
   codeGenerationInFlight = inFlight;
-  codeGenerationListeners.forEach(listener => listener(inFlight));
+  codeGenerationError = error;
+  codeGenerationListeners.forEach(listener => listener({ inFlight, error }));
 }
 
 function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInviteCodes, defaultServerUrl, defaultServerName, privateServers }: {
@@ -178,7 +190,7 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
   const [copied, setCopied] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string>("");
   const [generating, setGenerating] = useState(codeGenerationInFlight);
-  const mounted = useRef(true);
+  const [generateError, setGenerateError] = useState(codeGenerationError);
 
   // Change-password modal state
   const [showPwModal, setShowPwModal] = useState(false);
@@ -233,28 +245,37 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
   // Re-read the backend list rather than splicing into the `inviteCodes` prop:
   // a generation that finishes after a remount would otherwise append onto the
   // stale array captured when the click happened.
+  //
+  // Deliberately NOT gated on this component still being mounted. The codes live
+  // in App state, not local state, and App is always mounted — so dropping the
+  // result when IdentitySection happens to be unmounted threw away a completed
+  // refresh for no benefit and left the list stale until something else re-read
+  // it. Writing to a parent's state from a detached child is a no-op risk React
+  // has not warned about since v18; the real hazard here was the lost update.
   const refreshCodes = () =>
     invoke<Array<{ id: string; code: string; created_at: number; server_url: string; server_name?: string; reusable?: boolean }>>("messaging_list_connection_codes")
       .then(codes => {
-        if (!mounted.current) return;
         onChangeInviteCodes(codes.map(c => ({ id: c.id, code: c.code, createdAt: c.created_at, serverUrl: c.server_url, serverName: c.server_name, reusable: c.reusable })));
-      })
-      .catch(() => { });
+      });
 
   useEffect(() => {
-    mounted.current = true;
-    codeGenerationListeners.add(setGenerating);
-    void refreshCodes();
+    const onGeneration = (state: CodeGenerationState) => {
+      setGenerating(state.inFlight);
+      setGenerateError(state.error);
+    };
+    codeGenerationListeners.add(onGeneration);
+    // The passive refresh on mount stays quiet: there is nothing the user asked
+    // for to report against. A refresh driven by `addCode` propagates instead.
+    refreshCodes().catch(() => { });
     return () => {
-      mounted.current = false;
-      codeGenerationListeners.delete(setGenerating);
+      codeGenerationListeners.delete(onGeneration);
     };
   }, []);
 
   const addCode = async () => {
     if (codeGenerationInFlight) return;
-    setCodeGenerationInFlight(true);
-    setSaveError("");
+    publishCodeGeneration(true, "");
+    let failure = "";
     try {
       await invoke<{ id: string; code: string; created_at: number; server_url: string; server_name?: string; reusable?: boolean }>("messaging_generate_connection_code", {
         serverUrl: defaultServerUrl,
@@ -264,15 +285,20 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
       await refreshCodes();
       invoke("messaging_connect_all").catch(() => { });
     } catch (e) {
-      if (mounted.current) setSaveError(typeof e === "string" ? e : "Could not generate connection code");
+      failure = typeof e === "string" ? e : "Could not generate connection code";
     } finally {
-      setCodeGenerationInFlight(false);
+      // Publish the outcome at module scope so it survives a remount, and so a
+      // failure is reported rather than leaving the user staring at an unchanged
+      // list wondering whether it worked.
+      publishCodeGeneration(false, failure);
     }
   };
 
   const removeCode = async (id: string) => {
     await invoke("messaging_delete_connection_code", { id }).catch(() => { });
-    onChangeInviteCodes(inviteCodes.filter(c => c.id !== id));
+    // Re-read rather than splicing the prop, for the same reason `refreshCodes`
+    // exists: the array captured at click time can be a stale snapshot.
+    await refreshCodes().catch(() => { });
   };
 
   const copyCode = (id: string, code: string) => {
@@ -345,6 +371,10 @@ function IdentitySection({ displayName, onChangeName, inviteCodes, onChangeInvit
             Each code gets its own routing mailbox and expires after 30 days; deleting it disables your local receive route.
           </div>
         </div>
+
+        {generateError && (
+          <div className="onboarding-error settings-inline-error">{generateError}</div>
+        )}
 
         <div className="code-list">
           {inviteCodes.length === 0 && (
